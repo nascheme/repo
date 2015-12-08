@@ -1,9 +1,9 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # vim: set ai tw=74 sts=4 sw=4 et:
 #
 #
-from __future__ import division
-from __future__ import print_function
+
+
 
 
 USAGE = "Usage: %prog [options]"
@@ -86,7 +86,8 @@ def _write_meta(key_abs, name):
             data = {}
         old_data = data.copy()
         names = data.get('names', [])
-        name = try_decode(name)
+        #name = try_decode(name)
+        assert isinstance(name, str)
         if name not in names:
             names.append(name)
         names.sort()
@@ -98,9 +99,10 @@ def _write_meta(key_abs, name):
         if 'mtime' not in data or data['mtime'] > mtime:
             data['mtime'] = mtime
         if data != old_data:
-            with codecs.open(meta, 'w', encoding='utf8') as fp:
+            with codecs.open(meta + '.new', 'w', encoding='utf8') as fp:
                 log('write meta %s' % data)
                 json.dump(data, fp, indent=4)
+            os.rename(meta + '.new', meta)
         fcntl.flock(key, fcntl.LOCK_UN)
 
 _XATTR_KEY = 'user.repo.sha256'
@@ -110,6 +112,7 @@ def _get_xattr_hash(fn):
         d = xattr.getxattr(fn, _XATTR_KEY) or None
     except IOError:
         return None
+    d = d.decode('ascii')
     log('found xattr %r' % d)
     if ':' not in d:
         return None
@@ -127,8 +130,9 @@ def _get_xattr_hash(fn):
 
 def _set_xattr_hash(fn, digest):
     mtime = os.stat(fn).st_mtime
+    d = '%d:%s' % (int(mtime), digest)
     try:
-        xattr.setxattr(fn, _XATTR_KEY, '%d:%s' % (int(mtime), digest))
+        xattr.setxattr(fn, _XATTR_KEY, d.encode('ascii'))
     except IOError:
         pass
 
@@ -164,6 +168,19 @@ def _hash_file(src_fn, tmp=None):
     return h.hexdigest(), tmp
 
 
+def _link_over(src, dst):
+    i = 0
+    while True:
+        try:
+            tmp = '%s.%d' % (dst, i)
+            os.link(src, tmp)
+        except IOError:
+            i += 1
+        else:
+            break
+    os.rename(tmp, dst)
+
+
 class Object(object):
     def __init__(self, repo):
         self.repo = repo
@@ -176,7 +193,12 @@ class Object(object):
             assert len(digest) == _SHA256_LEN
         key_abs = repo.data(digest)
         if os.path.exists(key_abs):
-            print('skip existing %r' % src_fn)
+            if not os.path.samefile(src_fn, key_abs):
+                print('link over %r' % src_fn)
+                if not DRY_RUN:
+                    _link_over(key_abs, src_fn)
+            else:
+                print('skip existing %r' % src_fn)
         else:
             print('import', src_fn)
             if not DRY_RUN:
@@ -284,12 +306,10 @@ def annex_fix(args, repo):
         if os.path.samefile(repo_abs, obj_fn):
             log('obj linked, skipping %s' % obj_fn)
         else:
+            print('link over %s' % obj_fn)
             if not DRY_RUN:
                 with write_access(os.path.dirname(obj_fn)):
-                    print('link replace %s' % obj_fn)
-                    os.link(repo_abs, obj_fn + '.new')
-                    os.unlink(obj_fn)
-                    os.rename(obj_fn + '.new', obj_fn)
+                    _link_over(repo_abs, obj_fn)
 
     def do_link(fn):
         # link repo file into annex objects
@@ -323,7 +343,7 @@ def _annex_hashdirmixed(key):
     hasher.update(key)
     digest = hasher.digest()
     first_word = struct.unpack('<I', digest[:4])[0]
-    nums = [first_word >> (6 * x) & 31 for x in xrange(4)]
+    nums = [first_word >> (6 * x) & 31 for x in range(4)]
     letters = ["0123456789zqjxkmvwgpfZQJXKMVWGPF"[i] for i in nums]
     return "%s%s/%s%s/" % (letters[1], letters[0], letters[3], letters[2])
 
@@ -379,9 +399,10 @@ def do_index(repo):
                 log(path, rel)
                 index[path] = rel
     out_fn = os.path.join(repo.root, 'index.txt')
-    with codecs.open(out_fn, 'w', encoding='utf8') as fp:
+    with codecs.open(out_fn + '.new', 'w', encoding='utf8') as fp:
         for path in sorted(index):
-            fp.write(u'%s %s\n' % (path, index[path]))
+            fp.write('%s %s\n' % (path, index[path]))
+    os.rename(out_fn + '.new', out_fn)
 
 
 def main():
