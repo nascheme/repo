@@ -35,33 +35,6 @@ def ensure_dir(dn):
         os.makedirs(dn)
 
 
-_SHA256_LEN = 64
-
-class Repo(object):
-    def __init__(self, fn):
-        self.root = fn
-        self.obj_abs = os.path.join(fn, 'objects')
-
-    def key(self, digest):
-        assert len(digest) == _SHA256_LEN
-        return 'SHA256/%s/%s/%s' % (digest[:3], digest[3:6], digest[6:])
-
-    def data(self, digest):
-        return os.path.join(self.obj_abs, self.key(digest) + '.d')
-
-    def meta(self, digest):
-        return os.path.join(self.obj_abs, self.key(digest) + '.m')
-
-
-def try_decode(name):
-    if isinstance(name, str):
-        try:
-            name = name.decode('utf8')
-        except UnicodeDecodeError:
-            name = name.decode('latin1')
-    return name
-
-
 def _read_meta(key_abs):
     with open(key_abs, 'rb') as key:
         fcntl.flock(key, fcntl.LOCK_SH)
@@ -75,37 +48,138 @@ def _read_meta(key_abs):
     return data
 
 
-def _write_meta(key_abs, name):
-    with open(key_abs, 'rb') as key:
-        fcntl.flock(key, fcntl.LOCK_EX)
-        meta = key_abs.replace('.d', '.m')
-        if os.path.exists(meta):
-            with codecs.open(meta, 'r', encoding='utf8') as fp:
-                data = json.load(fp)
+_SHA256_LEN = 64
+
+class Repo(object):
+    def __init__(self, fn):
+        self.root = fn
+        self.tmp_dir = os.path.join(fn, 'tmp')
+        self.obj_abs = os.path.join(fn, 'objects')
+
+    def key(self, digest):
+        assert len(digest) == _SHA256_LEN
+        return 'SHA256/%s/%s/%s' % (digest[:3], digest[3:6], digest[6:])
+
+    def data(self, digest):
+        return os.path.join(self.obj_abs, self.key(digest) + '.d')
+
+    def meta(self, digest):
+        return os.path.join(self.obj_abs, self.key(digest) + '.m')
+
+    def exists(self, digest):
+        key_abs = self.data(digest)
+        return os.path.exists(key_abs)
+
+    def _copy_tmp(self, src_fn):
+        # copy external file to temporary file inside repo, store hash
+        if not DRY_RUN:
+            ensure_dir(self.tmp_dir)
+            tmp = tempfile.NamedTemporaryFile(dir=self.tmp_dir)
         else:
-            data = {}
-        old_data = data.copy()
-        names = data.get('names', [])
-        #name = try_decode(name)
-        assert isinstance(name, str)
-        if name not in names:
-            names.append(name)
-        names.sort()
-        data['names'] = names
-        data['version'] = 1
-        st = os.stat(key_abs)
-        data['size'] = st.st_size
-        mtime = int(st.st_mtime)
-        if 'mtime' not in data or data['mtime'] > mtime:
-            data['mtime'] = mtime
-        if data != old_data:
-            with codecs.open(meta + '.new', 'w', encoding='utf8') as fp:
-                log('write meta %s' % data)
-                json.dump(data, fp, indent=4)
-            os.rename(meta + '.new', meta)
-        fcntl.flock(key, fcntl.LOCK_UN)
+            tmp = None
+        digest, tmp = _hash_file(src_fn, tmp=tmp)
+        if not DRY_RUN:
+            mtime = os.stat(src_fn).st_mtime
+            _set_xattr_hash(tmp.name, digest, mtime)
+        return digest, tmp
+
+
+    def copy_in(self, src_fn, name):
+        """Copy external file into repo (different filesystem)"""
+        digest, tmp = self._copy_tmp(src_fn)
+        if self.exists(digest):
+            tmp.close() # discard
+        else:
+            log('copy', src_fn)
+            self.link_in(tmp.name, digest)
+            self.write_meta(digest, name)
+        return digest
+
+
+    def link_in(self, fn, digest):
+        """Link external file into repo (save filesystem)"""
+        assert len(digest) == _SHA256_LEN
+        key_abs = self.data(digest)
+        if os.path.exists(key_abs):
+            return
+        if not DRY_RUN:
+            ensure_dir(os.path.dirname(key_abs))
+            os.link(fn, key_abs)
+            _set_xattr_hash(key_abs, digest)
+            os.chmod(key_abs, 0o400)
+
+
+    def link_to(self, digest, dst_fn):
+        """Link repo object to new file"""
+        key_abs = self.data(digest)
+        if not DRY_RUN:
+            ensure_dir(os.path.dirname(dst_fn))
+            os.link(key_abs, dst_fn)
+
+
+    def link_overwrite(self, digest, dst_fn):
+        """Link repo object over existing file"""
+        key_abs = self.data(digest)
+        if os.path.samefile(key_abs, dst_fn):
+            log('linked already, skipping %s' % dst_fn)
+        else:
+            print('link over %s' % dst_fn)
+            if not DRY_RUN:
+                with write_access(os.path.dirname(dst_fn)):
+                    _link_over(key_abs, dst_fn)
+
+
+    def read_meta(self, digest):
+        key_abs = self.data(digest)
+        return _read_meta(key_abs)
+
+
+    def write_meta(self, digest, name):
+        assert len(digest) == _SHA256_LEN
+        if DRY_RUN:
+            return
+        key_abs = self.data(digest)
+        with open(key_abs, 'rb') as key:
+            fcntl.flock(key, fcntl.LOCK_EX)
+            meta = key_abs.replace('.d', '.m')
+            if os.path.exists(meta):
+                with codecs.open(meta, 'r', encoding='utf8') as fp:
+                    data = json.load(fp)
+            else:
+                data = {}
+            old_data = data.copy()
+            names = data.get('names', [])
+            #name = try_decode(name)
+            assert isinstance(name, str)
+            if name not in names:
+                names.append(name)
+            names.sort()
+            data['names'] = names
+            data['version'] = 1
+            st = os.stat(key_abs)
+            data['size'] = st.st_size
+            mtime = int(st.st_mtime)
+            if 'mtime' not in data or data['mtime'] > mtime:
+                data['mtime'] = mtime
+            if data != old_data:
+                with codecs.open(meta + '.new', 'w', encoding='utf8') as fp:
+                    log('write meta %s' % data)
+                    json.dump(data, fp, indent=4)
+                os.rename(meta + '.new', meta)
+            fcntl.flock(key, fcntl.LOCK_UN)
+
+
+def try_decode(name):
+    if isinstance(name, str):
+        try:
+            name = name.decode('utf8')
+        except UnicodeDecodeError:
+            name = name.decode('latin1')
+    return name
+
 
 _XATTR_KEY = 'user.repo.sha256'
+
 
 def _get_xattr_hash(fn):
     try:
@@ -128,13 +202,17 @@ def _get_xattr_hash(fn):
         return digest
     return None
 
-def _set_xattr_hash(fn, digest):
-    mtime = os.stat(fn).st_mtime
+
+def _set_xattr_hash(fn, digest, mtime=None):
+    # set extended attribute containing hash and mtime
+    if mtime is None:
+        mtime = os.stat(fn).st_mtime
     d = '%d:%s' % (int(mtime), digest)
-    try:
-        xattr.setxattr(fn, _XATTR_KEY, d.encode('ascii'))
-    except IOError:
-        pass
+    with write_access(fn):
+        try:
+            xattr.setxattr(fn, _XATTR_KEY, d.encode('ascii'))
+        except IOError:
+            pass
 
 
 class DummyFile(object):
@@ -181,18 +259,16 @@ def _link_over(src, dst):
     os.rename(tmp, dst)
 
 
-class Object(object):
-    def __init__(self, repo):
-        self.repo = repo
+def do_import(args, repo, prefix):
 
-    def store(self, src_fn, prefix, repo):
+    def store(src_fn):
         digest = attr_digest = _get_xattr_hash(src_fn)
         if digest is None:
             log('computing digest', src_fn)
             digest, tmp = _hash_file(src_fn)
             assert len(digest) == _SHA256_LEN
-        key_abs = repo.data(digest)
-        if os.path.exists(key_abs):
+        if repo.exists(digest):
+            key_abs = repo.data(digest)
             if not os.path.samefile(src_fn, key_abs):
                 print('link over %r' % src_fn)
                 if not DRY_RUN:
@@ -201,24 +277,33 @@ class Object(object):
                 print('skip existing %r' % src_fn)
         else:
             print('import', src_fn)
-            if not DRY_RUN:
-                ensure_dir(os.path.dirname(key_abs))
-                log(src_fn, '->', key_abs)
-                os.link(src_fn, key_abs)
-                os.chmod(key_abs, 0o400)
-        if not DRY_RUN:
-            _write_meta(key_abs, os.path.join(prefix, src_fn))
-            if attr_digest is None:
-                with write_access(key_abs):
-                    _set_xattr_hash(key_abs, digest)
-        self.key_abs = key_abs
+            repo.link_in(src_fn, digest)
+        # save filename in meta data
+        repo.write_meta(digest, os.path.join(prefix, src_fn))
 
-
-def do_import(args, repo, prefix):
     for fn in _walk_files(args):
         if os.path.isfile(fn):
-            obj = Object(repo)
-            obj.store(fn, prefix, repo)
+            store(fn)
+        else:
+            print('skip non-file', fn)
+    print('done.')
+
+
+def do_copy(args, dst_dir, repo, prefix):
+
+    def copy(fn):
+        dst_fn = os.path.join(dst_dir, fn)
+        if os.path.exists(dst_fn):
+            print('skip existing', dst_fn)
+        else:
+            name = os.path.join(prefix, fn)
+            digest = repo.copy_in(fn, name)
+            print('link', dst_fn)
+            repo.link_to(digest, dst_fn)
+
+    for fn in _walk_files(args):
+        if os.path.isfile(fn):
+            copy(fn)
         else:
             print('skip non-file', fn)
     print('done.')
@@ -249,7 +334,6 @@ class Annex(object):
         self.root, self.depth = _find_git(start_dir)
         self.obj_abs = _object_path(start_dir)
         self.tmp_dir = os.path.join(self.root, '.git', 'annex', 'misctmp')
-
 
 
 _SKIP_DIRS = set(['.git'])
@@ -296,38 +380,22 @@ def annex_fix(args, repo):
         _, _, digest = key.rpartition('--')
         return digest
 
-    def link_missing(repo_abs, obj_fn):
-        if not DRY_RUN:
-            ensure_dir(os.path.dirname(obj_fn))
-            print('link %s' % obj_fn)
-            os.link(repo_abs, obj_fn)
-
-    def link_overwrite(repo_abs, obj_fn):
-        if os.path.samefile(repo_abs, obj_fn):
-            log('obj linked, skipping %s' % obj_fn)
-        else:
-            print('link over %s' % obj_fn)
-            if not DRY_RUN:
-                with write_access(os.path.dirname(obj_fn)):
-                    _link_over(repo_abs, obj_fn)
-
     def do_link(fn):
         # link repo file into annex objects
         dst = os.readlink(fn)
         if '.git/annex/objects/' in dst and 'SHA256-' in dst:
             digest = annex_digest(dst)
-            repo_abs = repo.data(digest)
-            log('repo_abs', repo_abs)
-            if os.path.isfile(repo_abs):
+            if repo.exists(digest):
                 # found file in repo
                 obj_fn = annex_obj_path(dst)
                 if os.path.exists(obj_fn):
                     if FORCE:
-                        link_overwrite(repo_abs, obj_fn)
+                        repo.link_overwrite(digest, obj_fn)
                     else:
                         log('obj exists, skipping %s' % obj_fn)
                 else:
-                    link_missing(repo_abs, obj_fn)
+                    print('link %s' % obj_fn)
+                    repo.link_to(digest, obj_fn)
             else:
                 print('not found', fn)
 
@@ -413,12 +481,10 @@ def main():
     parser = optparse.OptionParser(USAGE)
     parser.add_option('--repo', '-r', default=None)
     parser.add_option('--prefix', '-p', default=None)
+    parser.add_option('--dst', '-d', default=None)
     parser.add_option('--force', '-f', default=False,
                      action="store_true",
                      help="force overwrite")
-#    parser.add_option('--link', '-l', default=False,
-#                     action="store_true",
-#                     help="hard-link files instead of copying them")
     parser.add_option('--dryrun', '-n', default=False,
                       action="store_true",
                       help="print actions, do not change anything")
@@ -444,6 +510,9 @@ def main():
     if action == 'import':
         # compute content-ids, link into repo, write meta-data
         do_import(args, repo, options.prefix)
+    elif action == 'copy':
+        # copy files from another device, then import
+        do_copy(args, options.dst, repo, options.prefix)
     elif action == 'index':
         do_index(repo)
     elif action == 'annex-fix':
