@@ -1,33 +1,23 @@
 #!/usr/bin/python3
 # vim: set ai tw=74 sts=4 sw=4 et:
 #
-#
-
-
-
+# Content indexed file repository
 
 USAGE = "Usage: %prog [options]"
 
-import sys
 import os
-import logging
 import tempfile
 import collections
 import fcntl
 import json
-import hashlib
-import struct
-import codecs
-import xattr
+import util
+from util import log
+import re
 
 DRY_RUN = False
-VERBOSE = False
 LINK = False
 FORCE = False
 
-def log(*args, **kwargs):
-    if VERBOSE:
-        print(*args, **kwargs)
 
 def ensure_dir(dn):
     if not os.path.exists(dn):
@@ -42,13 +32,11 @@ def _read_meta(key_abs):
         if not os.path.exists(meta):
             data = {}
         else:
-            with codecs.open(meta, 'r', encoding='utf8') as fp:
+            with util.open_text(meta, 'r') as fp:
                 data = json.load(fp)
         fcntl.flock(key, fcntl.LOCK_UN)
     return data
 
-
-_SHA256_LEN = 64
 
 class Repo(object):
     def __init__(self, fn):
@@ -57,7 +45,7 @@ class Repo(object):
         self.obj_abs = os.path.join(fn, 'objects')
 
     def key(self, digest):
-        assert len(digest) == _SHA256_LEN
+        assert len(digest) == util.SHA256_LEN, repr(digest)
         return 'SHA256/%s/%s/%s' % (digest[:3], digest[3:6], digest[6:])
 
     def data(self, digest):
@@ -65,6 +53,11 @@ class Repo(object):
 
     def meta(self, digest):
         return os.path.join(self.obj_abs, self.key(digest) + '.m')
+
+    def filename_digest(self, fn):
+        fn = fn.strip()[:-2]
+        parts = fn.split(os.path.sep)
+        return ''.join(parts[-3:])
 
     def exists(self, digest):
         key_abs = self.data(digest)
@@ -80,7 +73,7 @@ class Repo(object):
         digest, tmp = _hash_file(src_fn, tmp=tmp)
         if not DRY_RUN:
             mtime = os.stat(src_fn).st_mtime
-            _set_xattr_hash(tmp.name, digest, mtime)
+            util.set_xattr_hash(tmp.name, digest, mtime)
         return digest, tmp
 
 
@@ -98,14 +91,14 @@ class Repo(object):
 
     def link_in(self, fn, digest):
         """Link external file into repo (save filesystem)"""
-        assert len(digest) == _SHA256_LEN
+        assert len(digest) == util.SHA256_LEN, repr(digest)
         key_abs = self.data(digest)
         if os.path.exists(key_abs):
             return
         if not DRY_RUN:
             ensure_dir(os.path.dirname(key_abs))
             os.link(fn, key_abs)
-            _set_xattr_hash(key_abs, digest)
+            util.set_xattr_hash(key_abs, digest)
             os.chmod(key_abs, 0o400)
 
 
@@ -125,8 +118,8 @@ class Repo(object):
         else:
             print('link over %s' % dst_fn)
             if not DRY_RUN:
-                with write_access(os.path.dirname(dst_fn)):
-                    _link_over(key_abs, dst_fn)
+                with util.write_access(os.path.dirname(dst_fn)):
+                    util.link_over(key_abs, dst_fn)
 
 
     def read_meta(self, digest):
@@ -135,7 +128,7 @@ class Repo(object):
 
 
     def write_meta(self, digest, name):
-        assert len(digest) == _SHA256_LEN
+        assert len(digest) == util.SHA256_LEN, repr(digest)
         if DRY_RUN:
             return
         key_abs = self.data(digest)
@@ -143,17 +136,15 @@ class Repo(object):
             fcntl.flock(key, fcntl.LOCK_EX)
             meta = key_abs.replace('.d', '.m')
             if os.path.exists(meta):
-                with codecs.open(meta, 'r', encoding='utf8') as fp:
+                with util.open_text(meta) as fp:
                     data = json.load(fp)
             else:
                 data = {}
             old_data = data.copy()
+            name = util.clean_name(name)
             names = data.get('names', [])
-            #name = try_decode(name)
-            assert isinstance(name, str)
             if name not in names:
                 names.append(name)
-            names.sort()
             data['names'] = names
             data['version'] = 1
             st = os.stat(key_abs)
@@ -162,117 +153,35 @@ class Repo(object):
             if 'mtime' not in data or data['mtime'] > mtime:
                 data['mtime'] = mtime
             if data != old_data:
-                with codecs.open(meta + '.new', 'w', encoding='utf8') as fp:
+                with util.open_text(meta + '.new', 'w') as fp:
                     log('write meta %s' % data)
                     json.dump(data, fp, indent=4)
                 os.rename(meta + '.new', meta)
             fcntl.flock(key, fcntl.LOCK_UN)
 
 
-def try_decode(name):
-    if isinstance(name, str):
-        try:
-            name = name.decode('utf8')
-        except UnicodeDecodeError:
-            name = name.decode('latin1')
-    return name
-
-
-_XATTR_KEY = 'user.repo.sha256'
-
-
-def _get_xattr_hash(fn):
-    try:
-        d = xattr.getxattr(fn, _XATTR_KEY) or None
-    except IOError:
-        return None
-    d = d.decode('ascii')
-    log('found xattr %r' % d)
-    if ':' not in d:
-        return None
-    mtime, _, digest = d.partition(':')
-    if len(digest) != _SHA256_LEN:
-        return None
-    try:
-        mtime = int(mtime)
-    except:
-        return None
-    if int(os.stat(fn).st_mtime) == mtime:
-        log('found good digest')
-        return digest
-    return None
-
-
-def _set_xattr_hash(fn, digest, mtime=None):
-    # set extended attribute containing hash and mtime
-    if mtime is None:
-        mtime = os.stat(fn).st_mtime
-    d = '%d:%s' % (int(mtime), digest)
-    with write_access(fn):
-        try:
-            xattr.setxattr(fn, _XATTR_KEY, d.encode('ascii'))
-        except IOError:
-            pass
-
-
-class DummyFile(object):
-    def __init__(self, fn):
-        self.name = fn
-
-    def write(self, block):
-        pass
-
-    def flush(self):
-        pass
-
-    def close(self):
-        pass
-
-
-def _hash_file(src_fn, tmp=None):
-    if tmp is None:
-        tmp = DummyFile(src_fn)
-    h = hashlib.sha256()
-    with open(src_fn, 'rb') as fp:
-        size = 0
-        while True:
-            block = fp.read(20000)
-            if not block:
-                break
-            h.update(block)
-            tmp.write(block)
-            size += len(block)
-        tmp.flush()
-    return h.hexdigest(), tmp
-
-
-def _link_over(src, dst):
-    i = 0
-    while True:
-        try:
-            tmp = '%s.%d' % (dst, i)
-            os.link(src, tmp)
-        except IOError:
-            i += 1
-        else:
-            break
-    os.rename(tmp, dst)
+    def parse_index(self):
+        index_fn = os.path.join(self.root, 'index.txt')
+        with util.open_text(index_fn) as fp:
+            for line in fp:
+                name, _, digest = line.rstrip().rpartition(' ')
+                yield name, digest
 
 
 def do_import(args, repo, prefix):
 
     def store(src_fn):
-        digest = attr_digest = _get_xattr_hash(src_fn)
+        digest = attr_digest = util.get_xattr_hash(src_fn)
         if digest is None:
             log('computing digest', src_fn)
-            digest, tmp = _hash_file(src_fn)
-            assert len(digest) == _SHA256_LEN
+            digest, tmp = util.hash_file(src_fn)
+            assert len(digest) == util.SHA256_LEN, repr(digest)
         if repo.exists(digest):
             key_abs = repo.data(digest)
             if not os.path.samefile(src_fn, key_abs):
                 print('link over %r' % src_fn)
                 if not DRY_RUN:
-                    _link_over(key_abs, src_fn)
+                    util.link_over(key_abs, src_fn)
             else:
                 print('skip existing %r' % src_fn)
         else:
@@ -351,20 +260,6 @@ def _walk_files(args):
             yield fn
 
 
-class write_access(object):
-    def __init__(self, fn):
-        self.fn = fn
-        self.mode = None
-
-    def __enter__(self):
-        self.mode = os.stat(self.fn).st_mode
-        os.chmod(self.fn, self.mode | 0o600)
-
-    def __exit__(self, type, value, traceback):
-        if self.mode is not None:
-            os.chmod(self.fn, self.mode)
-
-
 def annex_fix(args, repo):
     annex = Annex(args[0])
 
@@ -376,7 +271,7 @@ def annex_fix(args, repo):
     def annex_digest(fn):
         # SHA256 hexdigest
         key = os.path.basename(fn)
-        assert key.startswith('SHA256-')
+        assert key.startswith('SHA256-'), repr(key)
         _, _, digest = key.rpartition('--')
         return digest
 
@@ -405,16 +300,6 @@ def annex_fix(args, repo):
     print('done.')
 
 
-# See docs in http://git-annex.branchable.com/internals/hashing/ and implementation in http://sources.debian.net/src/git-annex/5.20140227/Locations.hs/?hl=408#L408
-def _annex_hashdirmixed(key):
-    hasher = hashlib.md5()
-    hasher.update(key)
-    digest = hasher.digest()
-    first_word = struct.unpack('<I', digest[:4])[0]
-    nums = [first_word >> (6 * x) & 31 for x in range(4)]
-    letters = ["0123456789zqjxkmvwgpfZQJXKMVWGPF"[i] for i in nums]
-    return "%s%s/%s%s/" % (letters[1], letters[0], letters[3], letters[2])
-
 def annex_add(args, repo):
     annex = Annex(args[0])
 
@@ -422,11 +307,11 @@ def annex_add(args, repo):
         return 'SHA256-s%d--%s' % (size, digest)
 
     def annex_obj_path(key):
-        d = _annex_hashdirmixed(key)
+        d = util.annex_hashdirmixed(key)
         return os.path.join(annex.obj_abs, d, key, key)
 
     def do_add(fn):
-        digest = _get_xattr_hash(fn)
+        digest = util.get_xattr_hash(fn)
         if digest is None:
             print('missing xattr', fn)
             return
@@ -459,22 +344,43 @@ def do_index(repo):
             names = data.get('names') or []
             for name in names:
                 i = 1
+                name = util.clean_name(name)
                 path = name
                 while path in index:
                     path = '%s.%d' % (name, i)
                     i += 1
-                rel = os.path.relpath(fn, repo.obj_abs)
-                log(path, rel)
-                index[path] = rel
+                digest = repo.filename_digest(fn)
+                log(path, digest)
+                index[path] = digest
     out_fn = os.path.join(repo.root, 'index.txt')
-    with codecs.open(out_fn + '.new', 'w', encoding='utf8') as fp:
+    with util.open_text(out_fn + '.new', 'w') as fp:
         for path in sorted(index):
             fp.write('%s %s\n' % (path, index[path]))
     os.rename(out_fn + '.new', out_fn)
 
 
+def do_scrub(repo):
+    sums = set()
+    for name, digest in repo.parse_index():
+        sums.add(digest)
+    with util.open_text(os.path.join(repo.root, 'errors.txt'), 'w') as err:
+        for digest in sorted(sums):
+            fn = repo.data(digest)
+            digest2, tmp = util.hash_file(fn)
+            log(digest, digest2)
+            if digest != digest2:
+                mismatched.append(digest)
+                print('checksum mismatch', digest, file=err)
+            else:
+                digest2 = util.get_xattr_hash(fn)
+                if digest2 != digest:
+                    print('update xattr', digest, file=err)
+                    util.set_xattr_hash(fn, digest)
+
+
+
 def main():
-    global DRY_RUN, VERBOSE, LINK, FORCE
+    global DRY_RUN, LINK, FORCE
 
     import optparse
     import logging
@@ -500,7 +406,7 @@ def main():
     elif options.verbose > 1:
         level = logging.DEBUG
     DRY_RUN = options.dryrun
-    VERBOSE = options.verbose
+    util.VERBOSE = options.verbose
     FORCE = options.force
     #LINK = options.link
     logging.basicConfig(level=level)
@@ -515,6 +421,9 @@ def main():
         do_copy(args, options.dst, repo, options.prefix)
     elif action == 'index':
         do_index(repo)
+    elif action == 'scrub':
+        # check hashes
+        do_scrub(repo)
     elif action == 'annex-fix':
         # crawl symlinks, link found objects into .git/annex/objects
         annex_fix(args, repo)
