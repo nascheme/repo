@@ -378,6 +378,18 @@ def do_scrub(repo):
                     util.set_xattr_hash(fn, digest)
 
 
+def do_link_files(args, repo):
+    index = {}
+    for name, digest in repo.parse_index():
+        index[name] = digest
+    for pat in args:
+        p = re.compile(pat)
+        for fn in index:
+            if p.match(fn):
+                print('link', fn)
+                if not DRY_RUN:
+                    ensure_dir(os.path.dirname(fn))
+                repo.link_to(index[fn], fn)
 
 def main():
     global DRY_RUN, LINK, FORCE
@@ -430,6 +442,9 @@ def main():
     elif action == 'annex-add':
         # crawl files, add to annex objects, replace file with symlink
         annex_add(args, repo)
+    elif action == 'link':
+        # link files matching regex patterns
+        do_link_files(args, repo)
     else:
         raise SystemExit('unknown action %r' % action)
 
