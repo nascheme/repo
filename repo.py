@@ -11,8 +11,11 @@ import collections
 import fcntl
 import json
 import util
-from util import log
 import re
+import copy
+import contextlib
+import glob
+from util import log
 
 DRY_RUN = False
 LINK = False
@@ -25,17 +28,33 @@ def ensure_dir(dn):
         os.makedirs(dn)
 
 
-def _read_meta(key_abs):
-    with open(key_abs, 'rb') as key:
-        fcntl.flock(key, fcntl.LOCK_SH)
-        meta = key_abs.replace('.d', '.m')
-        if not os.path.exists(meta):
-            data = {}
-        else:
-            with util.open_text(meta, 'r') as fp:
-                data = json.load(fp)
-        fcntl.flock(key, fcntl.LOCK_UN)
+def _read_meta(meta):
+    if not os.path.exists(meta):
+        data = {'version': 1, 'files': {}}
+    else:
+        with util.open_text(meta, 'r') as fp:
+            data = json.load(fp)
     return data
+
+
+def _write_meta(meta, filename, digest, name):
+    all_data = _read_meta(meta)
+    if digest not in all_data['files']:
+        all_data['files'][digest] = {'names': []}
+    data = all_data['files'][digest]
+    name = util.clean_name(name)
+    if name in data['names']:
+        return
+    data['names'].append(name)
+    st = os.stat(filename)
+    data['size'] = st.st_size
+    mtime = int(st.st_mtime)
+    if 'mtime' not in data or data['mtime'] > mtime:
+        data['mtime'] = mtime
+    with util.open_text(meta + '.new', 'w') as fp:
+        log('write meta %s %s' % (meta, name))
+        json.dump(all_data, fp, indent=4)
+    os.rename(meta + '.new', meta)
 
 
 class Repo(object):
@@ -44,15 +63,39 @@ class Repo(object):
         self.tmp_dir = os.path.join(fn, 'tmp')
         self.obj_abs = os.path.join(fn, 'objects')
 
+    @contextlib.contextmanager
+    def lock_read(self):
+        lockfn = os.path.join(self.root, 'lock')
+        with open(lockfn, 'ab') as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    @contextlib.contextmanager
+    def lock_write(self):
+        lockfn = os.path.join(self.root, 'lock')
+        with open(lockfn, 'ab') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
     def key(self, digest):
         assert len(digest) == util.SHA256_LEN, repr(digest)
         return 'SHA256/%s/%s/%s' % (digest[:3], digest[3:6], digest[6:])
+
+    def meta_key(self, digest):
+        assert len(digest) == util.SHA256_LEN, repr(digest)
+        return 'SHA256/%s' % (digest[:3])
 
     def data(self, digest):
         return os.path.join(self.obj_abs, self.key(digest) + '.d')
 
     def meta(self, digest):
-        return os.path.join(self.obj_abs, self.key(digest) + '.m')
+        return os.path.join(self.obj_abs, self.meta_key(digest), 'meta.json')
 
     def filename_digest(self, fn):
         fn = fn.strip()[:-2]
@@ -70,7 +113,7 @@ class Repo(object):
             tmp = tempfile.NamedTemporaryFile(dir=self.tmp_dir)
         else:
             tmp = None
-        digest, tmp = _hash_file(src_fn, tmp=tmp)
+        digest, tmp = util.hash_file(src_fn, tmp=tmp)
         if not DRY_RUN:
             mtime = os.stat(src_fn).st_mtime
             util.set_xattr_hash(tmp.name, digest, mtime)
@@ -83,7 +126,7 @@ class Repo(object):
         if self.exists(digest):
             tmp.close() # discard
         else:
-            log('copy', src_fn)
+            log('copy in %s -> %s' % (src_fn, name))
             self.link_in(tmp.name, digest)
             self.write_meta(digest, name)
         return digest
@@ -123,49 +166,40 @@ class Repo(object):
 
 
     def read_meta(self, digest):
-        key_abs = self.data(digest)
-        return _read_meta(key_abs)
+        assert len(digest) == util.SHA256_LEN, repr(digest)
+        with self.lock_read():
+            meta = self.meta(digest)
+            data = _read_meta(meta)
+        return data
 
 
     def write_meta(self, digest, name):
         assert len(digest) == util.SHA256_LEN, repr(digest)
         if DRY_RUN:
             return
-        key_abs = self.data(digest)
-        with open(key_abs, 'rb') as key:
-            fcntl.flock(key, fcntl.LOCK_EX)
-            meta = key_abs.replace('.d', '.m')
-            if os.path.exists(meta):
-                with util.open_text(meta) as fp:
-                    data = json.load(fp)
-            else:
-                data = {}
-            old_data = data.copy()
-            name = util.clean_name(name)
-            names = data.get('names', [])
-            if name not in names:
-                names.append(name)
-            data['names'] = names
-            data['version'] = 1
-            st = os.stat(key_abs)
-            data['size'] = st.st_size
-            mtime = int(st.st_mtime)
-            if 'mtime' not in data or data['mtime'] > mtime:
-                data['mtime'] = mtime
-            if data != old_data:
-                with util.open_text(meta + '.new', 'w') as fp:
-                    log('write meta %s' % data)
-                    json.dump(data, fp, indent=4)
-                os.rename(meta + '.new', meta)
-            fcntl.flock(key, fcntl.LOCK_UN)
+        with self.lock_write():
+            meta = self.meta(digest)
+            _write_meta(meta, self.data(digest), digest, name)
 
 
-    def parse_index(self):
-        index_fn = os.path.join(self.root, 'index.txt')
-        with util.open_text(index_fn) as fp:
+    def list_files(self):
+        """Generate list of all files in the repo.  Generates hash key
+        and meta data dictionary pairs.
+        """
+        with self.lock_read():
+            for fn in glob.glob(os.path.join(self.obj_abs, '*/*/*.json')):
+                all_data = _read_meta(fn)
+                for digest, data in all_data['files'].items():
+                    yield digest, data
+
+
+    def parse_index(self, filename=None):
+        if not filename:
+            filename = os.path.join(self.root, 'index.txt')
+        with util.open_text(filename) as fp:
             for line in fp:
                 name, _, digest = line.rstrip().rpartition(' ')
-                yield name, digest
+                yield digest, name
 
 
 def do_import(args, repo, prefix):
@@ -198,21 +232,11 @@ def do_import(args, repo, prefix):
     print('done.')
 
 
-def do_copy(args, dst_dir, repo, prefix):
-
-    def copy(fn):
-        dst_fn = os.path.join(dst_dir, fn)
-        if os.path.exists(dst_fn):
-            print('skip existing', dst_fn)
-        else:
-            name = os.path.join(prefix, fn)
-            digest = repo.copy_in(fn, name)
-            print('link', dst_fn)
-            repo.link_to(digest, dst_fn)
-
+def do_copy(args, repo, prefix):
     for fn in _walk_files(args):
         if os.path.isfile(fn):
-            copy(fn)
+            name = os.path.join(prefix, fn)
+            digest = repo.copy_in(fn, name)
         else:
             print('skip non-file', fn)
     print('done.')
@@ -336,22 +360,23 @@ def annex_add(args, repo):
     print('done.')
 
 
-def do_index(repo):
+def _build_index(repo):
     index = {}
-    for fn in _walk_files([repo.obj_abs]):
-        if fn.endswith('.d'):
-            data = _read_meta(fn)
-            names = data.get('names') or []
-            for name in names:
-                i = 1
-                name = util.clean_name(name)
-                path = name
-                while path in index:
-                    path = '%s.%d' % (name, i)
-                    i += 1
-                digest = repo.filename_digest(fn)
-                log(path, digest)
-                index[path] = digest
+    for digest, data in repo.list_files():
+        for name in data['names']:
+            i = 1
+            name = util.clean_name(name)
+            path = name
+            while path in index:
+                path = '%s.%d' % (name, i)
+                i += 1
+            log(path, digest)
+            index[path] = digest
+    return index
+
+
+def do_index(repo):
+    index = _build_index(repo)
     out_fn = os.path.join(repo.root, 'index.txt')
     with util.open_text(out_fn + '.new', 'w') as fp:
         for path in sorted(index):
@@ -360,11 +385,8 @@ def do_index(repo):
 
 
 def do_scrub(repo):
-    sums = set()
-    for name, digest in repo.parse_index():
-        sums.add(digest)
     with util.open_text(os.path.join(repo.root, 'errors.txt'), 'w') as err:
-        for digest in sorted(sums):
+        for digest, meta_data in repo.list_files():
             fn = repo.data(digest)
             digest2, tmp = util.hash_file(fn)
             log(digest, digest2)
@@ -379,17 +401,20 @@ def do_scrub(repo):
 
 
 def do_link_files(args, repo):
+    import fnmatch
     index = {}
-    for name, digest in repo.parse_index():
-        index[name] = digest
+    for digest, meta_data in repo.list_files():
+        for name in meta_data['names']:
+            index[name] = digest
+    log('loaded %d files' % len(index))
     for pat in args:
-        p = re.compile(pat)
         for fn in index:
-            if p.match(fn):
+            if fnmatch.fnmatch(fn, pat):
                 print('link', fn)
                 if not DRY_RUN:
                     ensure_dir(os.path.dirname(fn))
                 repo.link_to(index[fn], fn)
+
 
 def main():
     global DRY_RUN, LINK, FORCE
@@ -430,7 +455,7 @@ def main():
         do_import(args, repo, options.prefix)
     elif action == 'copy':
         # copy files from another device, then import
-        do_copy(args, options.dst, repo, options.prefix)
+        do_copy(args, repo, options.prefix)
     elif action == 'index':
         do_index(repo)
     elif action == 'scrub':

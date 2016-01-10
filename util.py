@@ -21,7 +21,8 @@ def open_text(*args):
 def clean_name(name):
     assert isinstance(name, str), repr(name)
     # use canonical path separator
-    name = name.replace(os.path.sep, '/').strip('/')
+    if os.path.sep != '/':
+        name = name.replace(os.path.sep, '/').strip('/')
     # we don't support these characters in filenames
     name = name.replace('\r', ' ').replace('\n', ' ')
     return name
