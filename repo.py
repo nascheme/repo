@@ -15,12 +15,28 @@ import re
 import copy
 import contextlib
 import glob
+import sqlite3 as sqlite
+import pickle
 from util import log
 
 DRY_RUN = False
 LINK = False
 FORCE = False
 
+_DB_SCHEMA = '''\
+begin transaction;
+create table files (
+    digest text primary key,
+    size integer,
+    mtime integer
+    );
+create table names (
+    digest text,
+    name text,
+    primary key (digest, name)
+    );
+commit;
+'''
 
 def ensure_dir(dn):
     if not os.path.exists(dn):
@@ -28,40 +44,20 @@ def ensure_dir(dn):
         os.makedirs(dn)
 
 
-def _read_meta(meta):
-    if not os.path.exists(meta):
-        data = {'version': 1, 'files': {}}
-    else:
-        with util.open_text(meta, 'r') as fp:
-            data = json.load(fp)
-    return data
-
-
-def _write_meta(meta, filename, digest, name):
-    all_data = _read_meta(meta)
-    if digest not in all_data['files']:
-        all_data['files'][digest] = {'names': []}
-    data = all_data['files'][digest]
-    name = util.clean_name(name)
-    if name in data['names']:
-        return
-    data['names'].append(name)
-    st = os.stat(filename)
-    data['size'] = st.st_size
-    mtime = int(st.st_mtime)
-    if 'mtime' not in data or data['mtime'] > mtime:
-        data['mtime'] = mtime
-    with util.open_text(meta + '.new', 'w') as fp:
-        log('write meta %s %s' % (meta, name))
-        json.dump(all_data, fp, indent=4)
-    os.rename(meta + '.new', meta)
-
-
 class Repo(object):
     def __init__(self, fn):
         self.root = fn
         self.tmp_dir = os.path.join(fn, 'tmp')
         self.obj_abs = os.path.join(fn, 'objects')
+        self.idx_abs = os.path.join(fn, 'index.db')
+        if os.path.exists(self.idx_abs):
+            self.conn = sqlite.connect(self.idx_abs)
+        else:
+            self.conn = None
+
+    def init(self):
+        conn = sqlite.connect(self.idx_abs)
+        conn.executescript(_DB_SCHEMA)
 
     @contextlib.contextmanager
     def lock_read(self):
@@ -87,15 +83,8 @@ class Repo(object):
         assert len(digest) == util.SHA256_LEN, repr(digest)
         return 'SHA256/%s/%s/%s' % (digest[:3], digest[3:6], digest[6:])
 
-    def meta_key(self, digest):
-        assert len(digest) == util.SHA256_LEN, repr(digest)
-        return 'SHA256/%s' % (digest[:3])
-
     def data(self, digest):
         return os.path.join(self.obj_abs, self.key(digest) + '.d')
-
-    def meta(self, digest):
-        return os.path.join(self.obj_abs, self.meta_key(digest), 'meta.json')
 
     def filename_digest(self, fn):
         fn = fn.strip()[:-2]
@@ -105,6 +94,102 @@ class Repo(object):
     def exists(self, digest):
         key_abs = self.data(digest)
         return os.path.exists(key_abs)
+
+    def get_meta(self, digest):
+        c = self.conn.cursor()
+        c.execute('select size, mtime from files'
+                  ' where digest=?', (digest,))
+        if c.rowcount > 0:
+            size, mtime = c.fetchown()
+            return {'size': size, 'mtime': mtime}
+        return {}
+
+    def _add_file(self, digest, meta):
+        with self.conn:
+            self.conn.execute('insert into files (digest, size, mtime)'
+                              ' values (?, ?, ?)',
+                              (digest, meta.get('size'), meta.get('mtime')))
+
+    def add_file(self, digest, filename):
+        meta = self.get_meta(digest)
+        st = os.stat(filename)
+        if not meta:
+            # create it
+            self._add_file(digest, {'size': st.st_size, 'mtime': st.st_mtime})
+        else:
+            # ensure size matches
+            if meta.get('size') != st.st_size:
+                raise RuntimeError('size mismatch %s' % filename)
+
+    def get_names(self, digest):
+        c = self.conn.cursor()
+        c.execute('select (name) from names'
+                  ' where digest=?'
+                  ' order by name',
+                  (digest,))
+        names = c.fetchall()
+
+    def add_name(self, digest, name):
+        assert len(digest) == util.SHA256_LEN, repr(digest)
+        if DRY_RUN:
+            return
+        with self.conn:
+            self.conn.execute('insert or ignore into names'
+                              ' values (?, ?)', (digest, name))
+
+    def delete_files(self, digests):
+        with self.conn:
+            self.conn.executemany('delete from names where digest=?',
+                                  ((d,) for d in digests))
+
+    def set_names(self, digest, names):
+        assert len(digest) == util.SHA256_LEN, repr(digest)
+        with self.conn:
+            self.conn.execute('delete from names where digest=?', (digest,))
+            self.conn.executemany('insert into names (digest, name)'
+                                  ' values (?, ?)',
+                                  [(digest, name) for name in names])
+
+    def set_names_batch(self, files):
+        with self.conn:
+            digests = set(files.values())
+            for digest in digests:
+                assert len(digest) == util.SHA256_LEN, repr(digest)
+            self.conn.executemany('delete from names where digest=?',
+                                  ((d,) for d in digests))
+            self.conn.executemany('insert into names (name, digest)'
+                                  ' values (?, ?)', files.items())
+
+    def list_files(self):
+        """Generate list of all objects in the repo.  Generates hash key
+        for each object.
+        """
+        c = self.conn.cursor()
+        c.execute('select digest from files')
+        return (digest for (digest,) in c.fetchall())
+
+    def list_file_names(self):
+        """Generate list of all files in the repo.  Generates hash key
+        and meta data dictionary pairs.
+        """
+        c = self.conn.cursor()
+        c.execute('select name, digest from names'
+                  ' order by name')
+        return c.fetchall()
+
+    def get_deleted(self):
+        c = self.conn.cursor()
+        c.execute('select digest from files'
+                  ' where digest not in (select digest from names)')
+        return (digest for (digest,) in c.fetchall())
+
+    def get_sizes(self):
+        c = self.conn.cursor()
+        c.execute('select names.name, files.digest, files.size'
+                  ' from files'
+                  ' inner join names'
+                  ' where files.digest=names.digest')
+        return c.fetchall()
 
     def _copy_tmp(self, src_fn):
         # copy external file to temporary file inside repo, store hash
@@ -128,7 +213,8 @@ class Repo(object):
         else:
             log('copy in %s -> %s' % (src_fn, name))
             self.link_in(tmp.name, digest)
-            self.write_meta(digest, name)
+            self.add_file(digest, tmp.name)
+        self.add_name(digest, name)
         return digest
 
 
@@ -165,45 +251,17 @@ class Repo(object):
                     util.link_over(key_abs, dst_fn)
 
 
-    def read_meta(self, digest):
-        assert len(digest) == util.SHA256_LEN, repr(digest)
-        with self.lock_read():
-            meta = self.meta(digest)
-            data = _read_meta(meta)
-        return data
+def parse_index(fn):
+    index = {}
+    with util.open_text(fn) as fp:
+        for line in fp:
+            name, _, digest = line.rstrip().rpartition(' ')
+            index[name] = digest
+    return index
 
-
-    def write_meta(self, digest, name):
-        assert len(digest) == util.SHA256_LEN, repr(digest)
-        if DRY_RUN:
-            return
-        with self.lock_write():
-            meta = self.meta(digest)
-            _write_meta(meta, self.data(digest), digest, name)
-
-
-    def list_files(self):
-        """Generate list of all files in the repo.  Generates hash key
-        and meta data dictionary pairs.
-        """
-        with self.lock_read():
-            for fn in glob.glob(os.path.join(self.obj_abs, '*/*/*.json')):
-                all_data = _read_meta(fn)
-                for digest, data in all_data['files'].items():
-                    yield digest, data
-
-
-    def parse_index(self, filename=None):
-        if not filename:
-            filename = os.path.join(self.root, 'index.txt')
-        with util.open_text(filename) as fp:
-            for line in fp:
-                name, _, digest = line.rstrip().rpartition(' ')
-                yield digest, name
 
 
 def do_import(args, repo, prefix):
-
     def store(src_fn):
         digest = attr_digest = util.get_xattr_hash(src_fn)
         if digest is None:
@@ -213,7 +271,7 @@ def do_import(args, repo, prefix):
         if repo.exists(digest):
             key_abs = repo.data(digest)
             if not os.path.samefile(src_fn, key_abs):
-                print('link over %r' % src_fn)
+                print('link from repo %r' % src_fn)
                 if not DRY_RUN:
                     util.link_over(key_abs, src_fn)
             else:
@@ -222,7 +280,8 @@ def do_import(args, repo, prefix):
             print('import', src_fn)
             repo.link_in(src_fn, digest)
         # save filename in meta data
-        repo.write_meta(digest, os.path.join(prefix, src_fn))
+        repo.add_file(digest, src_fn)
+        repo.add_name(digest, os.path.join(prefix, src_fn))
 
     for fn in _walk_files(args):
         if os.path.isfile(fn):
@@ -362,50 +421,72 @@ def annex_add(args, repo):
 
 def _build_index(repo):
     index = {}
-    for digest, data in repo.list_files():
-        for name in data['names']:
-            i = 1
-            name = util.clean_name(name)
-            path = name
-            while path in index:
-                path = '%s.%d' % (name, i)
-                i += 1
-            log(path, digest)
-            index[path] = digest
+    for name, digest in repo.list_file_names():
+        i = 1
+        name = util.clean_name(name)
+        path = name
+        while path in index:
+            path = '%s.%d' % (name, i)
+            i += 1
+        log(path, digest)
+        index[path] = digest
     return index
 
+
+def do_index_db(repo):
+    fn = os.path.join(repo.root, 'index.db')
+    if os.path.exists(fn):
+        raise SystemExit('index db exists')
+    def gen_files():
+        for name, digest in repo.list_file_names():
+            yield (digest, data.get('size'), data.get('mtime'))
+    def gen_names():
+        for name, digest in repo.list_file_names():
+            for name in data['names']:
+                yield (digest, name)
+    with sql.connect(fn) as conn:
+        conn.executescript(_DB_SCHEMA)
+        conn.executemany('insert into files (digest, size, mtime)'
+                         ' values (?, ?, ?)', gen_files())
+        conn.executemany('insert into names (digest, name)'
+                         ' values (?, ?)', gen_names())
+        conn.commit()
 
 def do_index(repo):
     index = _build_index(repo)
     out_fn = os.path.join(repo.root, 'index.txt')
-    with util.open_text(out_fn + '.new', 'w') as fp:
-        for path in sorted(index):
-            fp.write('%s %s\n' % (path, index[path]))
-    os.rename(out_fn + '.new', out_fn)
-
+    fp = tempfile.NamedTemporaryFile('w', dir=repo.root, prefix='tmp-index.',
+                                     delete=False)
+    for path in sorted(index):
+        fp.write('%s %s\n' % (path, index[path]))
+    os.rename(fp.name, out_fn)
+    fp.close()
 
 def do_scrub(repo):
+    n = 0
     with util.open_text(os.path.join(repo.root, 'errors.txt'), 'w') as err:
-        for digest, meta_data in repo.list_files():
+        for digest in repo.list_files():
             fn = repo.data(digest)
             digest2, tmp = util.hash_file(fn)
             log(digest, digest2)
             if digest != digest2:
-                mismatched.append(digest)
                 print('checksum mismatch', digest, file=err)
+                n += 1
             else:
                 digest2 = util.get_xattr_hash(fn)
                 if digest2 != digest:
                     print('update xattr', digest, file=err)
                     util.set_xattr_hash(fn, digest)
+                    n += 1
+    if n:
+        print('problems were found (%s), see errors.txt' % n)
 
 
 def do_link_files(args, repo):
     import fnmatch
     index = {}
-    for digest, meta_data in repo.list_files():
-        for name in meta_data['names']:
-            index[name] = digest
+    for name, digest in repo.list_file_names():
+        index[name] = digest
     log('loaded %d files' % len(index))
     for pat in args:
         for fn in index:
@@ -415,6 +496,56 @@ def do_link_files(args, repo):
                     ensure_dir(os.path.dirname(fn))
                 repo.link_to(index[fn], fn)
 
+
+class PathInfo:
+    def __init__(self, path, parent=None):
+        self.path = path
+        self.parent = parent
+        self.children = []
+        self.size = 0
+
+def do_du_save(args, repo):
+    if len(args) != 1:
+        raise SystemExit('need one arg')
+    import pickle
+    files = {}
+    def get(fn):
+        if fn in files:
+            return files[fn]
+        dn = os.path.dirname(fn)
+        if dn != fn:
+            parent = get(dn)
+        else:
+            parent = None
+        files[fn] = p = PathInfo(fn, parent)
+        if parent:
+            parent.children.append(p)
+        return p
+    for name, digest, size in repo.get_sizes():
+        if not name.startswith('/'):
+            name = '/' + name
+        p = get(name)
+        p.size = size
+    root = files.get('/') or files.get('.')
+    root.parent = root
+    with open(args[0], 'wb') as fp:
+        pickle.dump(root, fp, protocol=2)
+
+
+def do_write_names(args, repo):
+    if len(args) != 1:
+        raise SystemExit('need one argument, index file')
+    index = parse_index(args[0])
+    objects = {}
+    for name, digest in index.items():
+        objects.setdefault(digest, []).append(name)
+    for digest, names in objects.items():
+        repo.set_names(digest, names)
+
+
+def do_show_deleted(repo):
+    for digest in repo.get_deleted():
+        print(digest)
 
 def main():
     global DRY_RUN, LINK, FORCE
@@ -450,7 +581,9 @@ def main():
     if not options.repo:
         raise SystemExit('need --repo option')
     repo = Repo(options.repo)
-    if action == 'import':
+    if action == 'init':
+        repo.init()
+    elif action == 'import':
         # compute content-ids, link into repo, write meta-data
         do_import(args, repo, options.prefix)
     elif action == 'copy':
@@ -470,6 +603,13 @@ def main():
     elif action == 'link':
         # link files matching regex patterns
         do_link_files(args, repo)
+    elif action == 'write-names':
+        # load names from index.txt or index.txt.new
+        do_write_names(args, repo)
+    elif action == 'deleted':
+        do_show_deleted(repo)
+    elif action == 'du-save':
+        do_du_save(args, repo)
     else:
         raise SystemExit('unknown action %r' % action)
 

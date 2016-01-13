@@ -22,7 +22,7 @@ YELLOW = '#fff873'
 FIXED_FONT = 'TkFixedFont'
 
 
-class NewDialog(object):
+class NewDialog:
 
     TITLE = 'New folder'
 
@@ -38,7 +38,7 @@ class NewDialog(object):
         f.pack()
         l = Label(f, text='Name')
         l.pack(side=LEFT)
-        y = Entry(f, textvariable=self.name)
+        y = Entry(f, width=50, textvariable=self.name)
         y.pack(side=LEFT)
         y.focus()
         def close(event=None):
@@ -52,7 +52,38 @@ class NewDialog(object):
         top.bind('<Escape>', cancel)
 
 
-class FileList(object):
+class RenameDialog:
+
+    TITLE = 'Rename file'
+
+    def __init__(self, parent, *args, **kwargs):
+        self.top = Toplevel(parent)
+        self.top.title(self.TITLE)
+        self.content(self.top, *args, **kwargs)
+        self.top.focus()
+
+    def content(self, top, old_name):
+        self.name = StringVar()
+        self.name.set(old_name)
+        f = Frame(top)
+        f.pack()
+        l = Label(f, text='Name')
+        l.pack(side=LEFT)
+        y = Entry(f, width=50, textvariable=self.name)
+        y.pack(side=LEFT)
+        y.focus()
+        def close(event=None):
+            top.destroy()
+        def cancel(event=None):
+            self.name.set(old_name)
+            close()
+        b = Button(top, text='OK', command=close)
+        b.pack(pady=5)
+        top.bind('<Return>', close)
+        top.bind('<Escape>', cancel)
+
+
+class FileList:
     def __init__(self, master, tree, browser):
         self.master = master
         self.tree = tree
@@ -68,7 +99,8 @@ class FileList(object):
         pl = Label(f, textvariable=self._cur_path)
         pl.pack()
 
-        self.lb = Listbox(f, width=50, font=FIXED_FONT, selectmode=EXTENDED)
+        self.lb = Listbox(f, width=80, height=30, font=FIXED_FONT,
+                          selectmode=EXTENDED)
         self.lb.pack(side=LEFT, expand=1, fill=Y)
         self.lb.bind('<Double-Button-1>', self._list_select)
 
@@ -87,6 +119,7 @@ class FileList(object):
         bind('<Control-v>', self.paste_items)
         bind('<Control-d>', self._delete_items)
         bind('<Control-n>', self._new_folder)
+        bind('<Control-r>', self._rename)
 
     def _get_sel(self):
         items = self.lb.curselection()
@@ -108,6 +141,20 @@ class FileList(object):
         v = d.name.get() or ''
         self._cwd.get_child(v)
         self.browser.update()
+
+    def _rename(self, event=None):
+        sel = self._get_sel()
+        if len(sel) != 1:
+            return
+        node = sel[0]
+        d = RenameDialog(self.master, node.name)
+        self.master.wait_window(d.top)
+        new = d.name.get()
+        print('new', new)
+        if new != node.name:
+            print(node.name, '->', new)
+            self.tree.rename(node, new)
+            self.browser.update()
 
     def cut_items(self, event=None):
         self.tree.clip_items = self._get_sel()
@@ -132,8 +179,8 @@ class FileList(object):
         if n.parent is not None:
             self.lb.insert(END, '..')
             self._files.append(n.parent)
-        for name, child in sorted(n.children.items()):
-            text = name
+        for child in sorted(n.children, key=lambda c: c.name):
+            text = child.name
             if child.key is None:
                 text += '/'
             self.lb.insert(END, text)
@@ -146,13 +193,21 @@ class Node(object):
         self.name = name
         self.parent = parent
         self.key = None
-        self.children = {}
+        self.children = []
+
+    def note_change(self, changed):
+        if self.key:
+            changed.add(self.key)
+        for c in self.children:
+            c.note_change(changed)
 
     def get_child(self, name):
-        if name in self.children:
-            return self.children[name]
-        node = self.children[name] = Node(name, self)
-        return node
+        for c in self.children:
+            if c.name == name:
+                return c
+        c = Node(name, self)
+        self.children.append(c)
+        return c
 
     def get_path(self):
         parts = []
@@ -164,16 +219,19 @@ class Node(object):
         return '/'.join(parts)
 
     def __contains__(self, name):
-        return name in self.children
+        for c in self.children:
+            if c.name == name:
+                return True
+        return False
 
-    def __setitem__(self, name, node):
-        self.children[name] = node
-
-    def __getitem__(self,name):
-        return self.children[name]
+    def __getitem__(self, name):
+        for c in self.children:
+            if c.name == name:
+                return c
+        raise KeyError(name)
 
     def remove(self, node):
-        del self.children[node.name]
+        self.children.remove(node)
 
 
 
@@ -183,6 +241,7 @@ class Tree(object):
         self.root = Node('', None)
         self.clip_items = []
         self.clip_mode = None
+        self._changed = set()
         self._load()
 
     def get_node(self, path):
@@ -192,43 +251,57 @@ class Tree(object):
         return obj
 
     def _load(self):
-        fn = os.path.join(self.repo.root, 'index.txt.new')
-        if os.path.exists(fn):
-            for digest, name in self.repo.parse_index(fn):
-                node = self.get_node(name)
-                assert node.key is None, (node.key, node.get_path())
-                node.key = digest
-        else:
-            for digest, meta in self.repo.list_files():
-                for name in meta['names']:
-                    node = self.get_node(name)
-                    assert node.key is None, (node.key, node.get_path())
-                    node.key = digest
+        #fn = os.path.join(self.repo.root, 'index.txt.new')
+        #if os.path.exists(fn):
+        #    files = repo.parse_index(fn).items()
+        #else:
+        files = self.repo.list_file_names()
+        for name, digest in files:
+            node = self.get_node(name)
+            assert node.key is None, (node.key, node.get_path())
+            node.key = digest
+
+    def note_change(self, node):
+        node.note_change(self._changed)
+
+    def is_changed(self, node):
+        return node.key in self._changed
+
+    def rename(self, node, name):
+        node.name = name
+        self.note_change(node)
 
     def delete_items(self, nodes):
         for n in nodes:
             print('rm %s' % n.name)
             n.parent.remove(n)
+            self.note_change(n)
 
     def paste_items(self, node):
         if self.clip_mode != 'move':
             print('skip operation', self.clip_mode)
             return
         for n in self.clip_items:
+            print('paste', n.name)
             if n.name in node:
                 if n.key is None:
+                    print('skip dir collision')
                     continue
-                other = node.children[n.name]
+                other = node[n.name]
                 if n.key != other.key:
-                    print('collision %s %s %s', (n.name, n.key, other.key))
+                    print('collision %s %s %s' % (n.name, n.key, other.key))
                     continue
                 else:
-                    print('discard %s' % n.name)
-                    n.parent.remove(n)
+                    if n is not other:
+                        print('discard %s' % n.name)
+                        n.parent.remove(n)
+                        self.note_change(n)
             else:
-                node[n.name] = n
+                print('mv %s -> %s' % (n.get_path(), node.get_path()))
+                node.children.append(n)
                 n.parent.remove(n)
                 n.parent = node
+                self.note_change(n)
         self.clip_items = []
 
 
@@ -255,22 +328,26 @@ class Browser(object):
         todo = collections.deque([self.tree.root])
         while todo:
             n = todo.popleft()
-            if n.key:
+            if n.key and self.tree.is_changed(n):
                 if n.key not in index:
                     index[n.key] = []
+                print('write', n.get_path())
                 index[n.key].append(n.get_path())
-            todo.extend(n.children.values())
-        lines = []
+            todo.extend(n.children)
+        files = {}
         for digest, names in index.items():
             for name in names:
-                lines.append('%s %s\n' % (name, digest))
-        lines.sort()
-        fn = os.path.join(self.tree.repo.root, 'index.txt.new')
-        with repo.util.open_text(fn, 'w') as fp:
-            fp.writelines(lines)
+                assert name not in files, (name, digest)
+                files[name] = digest
+        self.tree.repo.set_names_batch(files)
+        deleted = list(d for d in self.tree._changed if d not in index)
+        if deleted:
+            print('delete', deleted)
+            self.tree.repo.delete_files(deleted)
+        self.tree._changed.clear()
 
     def _create_ui(self):
-        f = Frame(self.master, height=900)
+        f = Frame(self.master)
         f.pack(expand=1, fill=Y)
 
         self.l1 = FileList(f, self.tree, self)
