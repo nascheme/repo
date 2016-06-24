@@ -77,10 +77,13 @@ class RenameDialog:
         def cancel(event=None):
             self.name.set(old_name)
             close()
+        def select_all(event=None):
+            y.select_range(0, END)
         b = Button(top, text='OK', command=close)
         b.pack(pady=5)
         top.bind('<Return>', close)
         top.bind('<Escape>', cancel)
+        top.bind('<Control-a>', select_all)
 
 
 class FileList:
@@ -242,6 +245,7 @@ class Tree(object):
         self.clip_items = []
         self.clip_mode = None
         self._changed = set()
+        self.old_index = {}
         self._load()
 
     def get_node(self, path):
@@ -251,12 +255,9 @@ class Tree(object):
         return obj
 
     def _load(self):
-        #fn = os.path.join(self.repo.root, 'index.txt.new')
-        #if os.path.exists(fn):
-        #    files = repo.parse_index(fn).items()
-        #else:
         files = self.repo.list_file_names()
         for name, digest in files:
+            self.old_index[name] = digest
             node = self.get_node(name)
             assert node.key is None, (node.key, node.get_path())
             node.key = digest
@@ -324,27 +325,30 @@ class Browser(object):
         self.master.destroy()
 
     def save_file(self, event=None):
-        index = {}
+        files = {}
+        digests = set()
         todo = collections.deque([self.tree.root])
         while todo:
             n = todo.popleft()
-            if n.key and self.tree.is_changed(n):
-                if n.key not in index:
-                    index[n.key] = []
-                print('write', n.get_path())
-                index[n.key].append(n.get_path())
+            if n.key:
+                path = n.get_path()
+                if self.tree.old_index.get(path) != n.key:
+                    files[path] = n.key
+                    print('write', path, n.key)
+                digests.add(n.key)
             todo.extend(n.children)
-        files = {}
-        for digest, names in index.items():
-            for name in names:
-                assert name not in files, (name, digest)
-                files[name] = digest
-        self.tree.repo.set_names_batch(files)
-        deleted = list(d for d in self.tree._changed if d not in index)
+        if files:
+            self.tree.repo.set_names_batch(files)
+        deleted = set()
+        for name, digest in self.tree.old_index.items():
+            if digest not in digests:
+                deleted.add(digest)
         if deleted:
             print('delete', deleted)
-            self.tree.repo.delete_files(deleted)
+            self.tree.repo.delete_files(list(deleted))
         self.tree._changed.clear()
+        if files or deleted:
+            self.tree.repo.commit()
 
     def _create_ui(self):
         f = Frame(self.master)
