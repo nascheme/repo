@@ -198,12 +198,6 @@ class Node(object):
         self.key = None
         self.children = []
 
-    def note_change(self, changed):
-        if self.key:
-            changed.add(self.key)
-        for c in self.children:
-            c.note_change(changed)
-
     def get_child(self, name):
         for c in self.children:
             if c.name == name:
@@ -244,7 +238,6 @@ class Tree(object):
         self.root = Node('', None)
         self.clip_items = []
         self.clip_mode = None
-        self._changed = set()
         self.old_index = {}
         self._load()
 
@@ -262,21 +255,13 @@ class Tree(object):
             assert node.key is None, (node.key, node.get_path())
             node.key = digest
 
-    def note_change(self, node):
-        node.note_change(self._changed)
-
-    def is_changed(self, node):
-        return node.key in self._changed
-
     def rename(self, node, name):
         node.name = name
-        self.note_change(node)
 
     def delete_items(self, nodes):
         for n in nodes:
             print('rm %s' % n.name)
             n.parent.remove(n)
-            self.note_change(n)
 
     def paste_items(self, node):
         if self.clip_mode != 'move':
@@ -296,13 +281,11 @@ class Tree(object):
                     if n is not other:
                         print('discard %s' % n.name)
                         n.parent.remove(n)
-                        self.note_change(n)
             else:
                 print('mv %s -> %s' % (n.get_path(), node.get_path()))
                 node.children.append(n)
                 n.parent.remove(n)
                 n.parent = node
-                self.note_change(n)
         self.clip_items = []
 
 
@@ -346,7 +329,6 @@ class Browser(object):
         if deleted:
             print('delete', deleted)
             self.tree.repo.delete_files(list(deleted))
-        self.tree._changed.clear()
         if files or deleted:
             self.tree.repo.commit()
 
