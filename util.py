@@ -14,8 +14,8 @@ def log(*args, **kwargs):
         print(*args, **kwargs)
 
 
-def open_text(*args):
-    return codecs.open(*args, encoding='utf8')
+def open_text(*args, **kw):
+    return open(*args, encoding='utf8', **kw)
 
 
 def clean_name(name):

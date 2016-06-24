@@ -3,11 +3,26 @@
 #
 # Content indexed file repository
 
-USAGE = "Usage: %prog [options]"
+USAGE = """Usage: %prog [options]
+
+  init
+    initialize repo
+  import <file> [<file> ...]
+    link files into repo, write meta-data
+  copy <file> [<file> ...]
+    copy files into repo, write meta-data
+  link <pat> [<pat> ...]
+    link mataching files from repo
+  index
+    create index file
+  scrub
+    verify hashes
+"""
 
 import os
 import tempfile
 import collections
+import datetime
 import fcntl
 import json
 import util
@@ -22,6 +37,7 @@ from util import log
 DRY_RUN = False
 LINK = False
 FORCE = False
+CONTINUE = None
 
 _DB_SCHEMA = '''\
 begin transaction;
@@ -50,6 +66,7 @@ class Repo(object):
         self.tmp_dir = os.path.join(fn, 'tmp')
         self.obj_abs = os.path.join(fn, 'objects')
         self.idx_abs = os.path.join(fn, 'index.db')
+        self._changed = False
         if os.path.exists(self.idx_abs):
             self.conn = sqlite.connect(self.idx_abs)
         else:
@@ -58,6 +75,10 @@ class Repo(object):
     def init(self):
         conn = sqlite.connect(self.idx_abs)
         conn.executescript(_DB_SCHEMA)
+
+    def commit(self):
+        if self._changed:
+            self.conn.commit()
 
     @contextlib.contextmanager
     def lock_read(self):
@@ -104,22 +125,12 @@ class Repo(object):
             return {'size': size, 'mtime': mtime}
         return {}
 
-    def _add_file(self, digest, meta):
-        with self.conn:
-            self.conn.execute('insert into files (digest, size, mtime)'
-                              ' values (?, ?, ?)',
-                              (digest, meta.get('size'), meta.get('mtime')))
-
     def add_file(self, digest, filename):
-        meta = self.get_meta(digest)
         st = os.stat(filename)
-        if not meta:
-            # create it
-            self._add_file(digest, {'size': st.st_size, 'mtime': st.st_mtime})
-        else:
-            # ensure size matches
-            if meta.get('size') != st.st_size:
-                raise RuntimeError('size mismatch %s' % filename)
+        self.conn.execute('insert or ignore into files (digest, size, mtime)'
+                          ' values (?, ?, ?)',
+                          (digest, st.st_size, st.st_mtime))
+        self._changed = True
 
     def get_names(self, digest):
         c = self.conn.cursor()
@@ -133,39 +144,42 @@ class Repo(object):
         assert len(digest) == util.SHA256_LEN, repr(digest)
         if DRY_RUN:
             return
-        with self.conn:
-            self.conn.execute('insert or ignore into names'
-                              ' values (?, ?)', (digest, name))
+        self.conn.execute('insert or ignore into names'
+                          ' values (?, ?)', (digest, name))
+        self._changed = True
 
     def delete_files(self, digests):
-        with self.conn:
-            self.conn.executemany('delete from names where digest=?',
-                                  ((d,) for d in digests))
+        self.conn.executemany('delete from names where digest=?',
+                              ((d,) for d in digests))
+        self.conn.executemany('delete from files where digest=?',
+                              ((d,) for d in digests))
+        self._changed = True
 
     def set_names(self, digest, names):
         assert len(digest) == util.SHA256_LEN, repr(digest)
-        with self.conn:
-            self.conn.execute('delete from names where digest=?', (digest,))
-            self.conn.executemany('insert into names (digest, name)'
-                                  ' values (?, ?)',
-                                  [(digest, name) for name in names])
+        self.conn.execute('delete from names where digest=?', (digest,))
+        self.conn.executemany('insert into names (digest, name)'
+                              ' values (?, ?)',
+                              [(digest, name) for name in names])
+        self._changed = True
 
     def set_names_batch(self, files):
-        with self.conn:
-            digests = set(files.values())
-            for digest in digests:
-                assert len(digest) == util.SHA256_LEN, repr(digest)
-            self.conn.executemany('delete from names where digest=?',
-                                  ((d,) for d in digests))
-            self.conn.executemany('insert into names (name, digest)'
-                                  ' values (?, ?)', files.items())
+        digests = set(files.values())
+        for digest in digests:
+            assert len(digest) == util.SHA256_LEN, repr(digest)
+        self.conn.executemany('delete from names where digest=?',
+                              ((d,) for d in digests))
+        self.conn.executemany('insert into names (name, digest)'
+                              ' values (?, ?)', files.items())
+        self._changed = True
 
     def list_files(self):
         """Generate list of all objects in the repo.  Generates hash key
         for each object.
         """
         c = self.conn.cursor()
-        c.execute('select digest from files')
+        c.execute('select digest from files'
+                  ' order by digest')
         return (digest for (digest,) in c.fetchall())
 
     def list_file_names(self):
@@ -205,38 +219,48 @@ class Repo(object):
         return digest, tmp
 
 
+    def _link_in(self, fn, digest):
+        assert len(digest) == util.SHA256_LEN, repr(digest)
+        key_abs = self.data(digest)
+        if not DRY_RUN:
+            util.set_xattr_hash(fn, digest)
+            if not os.path.exists(key_abs):
+                ensure_dir(os.path.dirname(key_abs))
+            else:
+                os.unlink(key_abs)
+            os.link(fn, key_abs)
+            os.chmod(key_abs, 0o400)
+
     def copy_in(self, src_fn, name):
         """Copy external file into repo (different filesystem)"""
         digest, tmp = self._copy_tmp(src_fn)
         if self.exists(digest):
-            tmp.close() # discard
+            log('copy over %s -> %s' % (src_fn, name))
         else:
-            log('copy in %s -> %s' % (src_fn, name))
-            self.link_in(tmp.name, digest)
-            self.add_file(digest, tmp.name)
+            log('copy new %s -> %s' % (src_fn, name))
+        self._link_in(tmp.name, digest)
+        self.add_file(digest, tmp.name)
         self.add_name(digest, name)
         return digest
 
 
     def link_in(self, fn, digest):
         """Link external file into repo (save filesystem)"""
-        assert len(digest) == util.SHA256_LEN, repr(digest)
-        key_abs = self.data(digest)
-        if os.path.exists(key_abs):
-            return
-        if not DRY_RUN:
-            ensure_dir(os.path.dirname(key_abs))
-            os.link(fn, key_abs)
-            util.set_xattr_hash(key_abs, digest)
-            os.chmod(key_abs, 0o400)
-
+        if os.path.exists(self.data(digest)):
+            log('link over %s' % fn)
+        else:
+            log('link new %s' % fn)
+        self._link_in(fn, digest)
 
     def link_to(self, digest, dst_fn):
         """Link repo object to new file"""
         key_abs = self.data(digest)
         if not DRY_RUN:
             ensure_dir(os.path.dirname(dst_fn))
-            os.link(key_abs, dst_fn)
+            if os.path.exists(dst_fn):
+                log('skip existing %s' % dst_fn)
+            else:
+                os.link(key_abs, dst_fn)
 
 
     def link_overwrite(self, digest, dst_fn):
@@ -279,8 +303,8 @@ def do_import(args, repo, prefix):
         else:
             print('import', src_fn)
             repo.link_in(src_fn, digest)
+            repo.add_file(digest, src_fn)
         # save filename in meta data
-        repo.add_file(digest, src_fn)
         repo.add_name(digest, os.path.join(prefix, src_fn))
 
     for fn in _walk_files(args):
@@ -298,6 +322,7 @@ def do_copy(args, repo, prefix):
             digest = repo.copy_in(fn, name)
         else:
             print('skip non-file', fn)
+    repo.conn.commit()
     print('done.')
 
 
@@ -459,23 +484,55 @@ def do_index(repo):
                                      delete=False)
     for path in sorted(index):
         fp.write('%s %s\n' % (path, index[path]))
+    print('created index', out_fn)
     os.rename(fp.name, out_fn)
     fp.close()
 
+def do_fix_path(repo):
+    filenames = {}
+    fix = False
+    for name, digest in repo.list_file_names():
+        if name.startswith('/'):
+            print(digest, name)
+            fix = True
+            name = name.lstrip('/')
+        filenames[name] = digest
+    if fix:
+        print('set_names')
+        repo.set_names_batch(filenames)
+
+
+
+
 def do_scrub(repo):
+    global CONTINUE
     n = 0
-    with util.open_text(os.path.join(repo.root, 'errors.txt'), 'w') as err:
+    err_file = os.path.join(repo.root, 'errors.txt')
+    with util.open_text(err_file, 'a', buffering=1) as err_fp:
+        def err(*args):
+            print(*args, file=err_fp)
+        err('scrub started %s' % datetime.datetime.now())
+        if CONTINUE:
+            err('continue from %s' % CONTINUE)
         for digest in repo.list_files():
+            if CONTINUE:
+                if digest == CONTINUE:
+                    CONTINUE = False
+                else:
+                    continue # skip
             fn = repo.data(digest)
+            if not os.path.exists(fn):
+                err('missing data', digest)
+                continue
             digest2, tmp = util.hash_file(fn)
             log(digest, digest2)
             if digest != digest2:
-                print('checksum mismatch', digest, file=err)
+                err('checksum mismatch', digest)
                 n += 1
             else:
                 digest2 = util.get_xattr_hash(fn)
                 if digest2 != digest:
-                    print('update xattr', digest, file=err)
+                    err('update xattr', digest)
                     util.set_xattr_hash(fn, digest)
                     n += 1
     if n:
@@ -547,15 +604,26 @@ def do_show_deleted(repo):
     for digest in repo.get_deleted():
         print(digest)
 
+def do_delete_missing(args, repo):
+    for digest in args:
+        assert not repo.exists(digest)
+    repo.delete_files(args)
+
+def do_delete(args, repo):
+    digests = args
+    repo.delete_files(digests)
+
+
 def main():
-    global DRY_RUN, LINK, FORCE
+    global DRY_RUN, LINK, FORCE, CONTINUE
 
     import optparse
     import logging
     parser = optparse.OptionParser(USAGE)
     parser.add_option('--repo', '-r', default=None)
-    parser.add_option('--prefix', '-p', default=None)
+    parser.add_option('--prefix', '-p', default='/')
     parser.add_option('--dst', '-d', default=None)
+    parser.add_option('--continue', '-c', default=None, dest='cont')
     parser.add_option('--force', '-f', default=False,
                      action="store_true",
                      help="force overwrite")
@@ -576,6 +644,7 @@ def main():
     DRY_RUN = options.dryrun
     util.VERBOSE = options.verbose
     FORCE = options.force
+    CONTINUE = options.cont
     #LINK = options.link
     logging.basicConfig(level=level)
     if not options.repo:
@@ -591,6 +660,8 @@ def main():
         do_copy(args, repo, options.prefix)
     elif action == 'index':
         do_index(repo)
+    elif action == 'fix-path':
+        do_fix_path(repo)
     elif action == 'scrub':
         # check hashes
         do_scrub(repo)
@@ -608,10 +679,15 @@ def main():
         do_write_names(args, repo)
     elif action == 'deleted':
         do_show_deleted(repo)
+    elif action == 'delete-missing':
+        do_delete_missing(args, repo)
+    elif action == 'delete':
+        do_delete(args, repo)
     elif action == 'du-save':
         do_du_save(args, repo)
     else:
         raise SystemExit('unknown action %r' % action)
+    repo.commit()
 
 if __name__ == '__main__':
     main()
