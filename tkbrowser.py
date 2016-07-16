@@ -311,25 +311,27 @@ class Browser(object):
         files = {}
         digests = set()
         todo = collections.deque([self.tree.root])
+        changed = False
         while todo:
             n = todo.popleft()
             if n.key:
                 path = n.get_path()
                 if self.tree.old_index.get(path) != n.key:
-                    files[path] = n.key
+                    changed = True
                     print('write', path, n.key)
+                files[path] = n.key
                 digests.add(n.key)
             todo.extend(n.children)
-        if files:
-            self.tree.repo.set_names_batch(files)
         deleted = set()
         for name, digest in self.tree.old_index.items():
             if digest not in digests:
+                print('delete', digest, name)
                 deleted.add(digest)
-        if deleted:
-            print('delete', deleted)
+        if changed:
+            self.tree.repo.set_names_batch(files, digests)
+            self.tree.repo.commit()
+        elif deleted:
             self.tree.repo.delete_files(list(deleted))
-        if files or deleted:
             self.tree.repo.commit()
 
     def _create_ui(self):

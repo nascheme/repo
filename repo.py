@@ -13,6 +13,8 @@ USAGE = """Usage: %prog [options]
     copy files into repo, write meta-data
   link <pat> [<pat> ...]
     link mataching files from repo
+  ls <pat> [<pat> ...]
+    list matching files
   index
     create index file
   scrub
@@ -22,6 +24,7 @@ USAGE = """Usage: %prog [options]
 import os
 import tempfile
 import collections
+import time
 import datetime
 import fcntl
 import json
@@ -38,6 +41,12 @@ DRY_RUN = False
 LINK = False
 FORCE = False
 CONTINUE = None
+NO_ALIAS = False
+
+_DB_PRAGMA = '''\
+PRAGMA synchronous=OFF;
+PRAGMA cache_size=200000;
+'''
 
 _DB_SCHEMA = '''\
 begin transaction;
@@ -69,16 +78,24 @@ class Repo(object):
         self._changed = False
         if os.path.exists(self.idx_abs):
             self.conn = sqlite.connect(self.idx_abs)
+            self._pragma()
         else:
             self.conn = None
 
+    def _pragma(self):
+        #c = self.conn.cursor()
+        #c.execute(_DB_PRAGMA)
+        self.conn.executescript(_DB_PRAGMA)
+
     def init(self):
-        conn = sqlite.connect(self.idx_abs)
-        conn.executescript(_DB_SCHEMA)
+        self.conn = sqlite.connect(self.idx_abs)
+        self._pragma()
+        self.conn.executescript(_DB_SCHEMA)
 
     def commit(self):
         if self._changed:
             self.conn.commit()
+            self._changed = False
 
     @contextlib.contextmanager
     def lock_read(self):
@@ -121,7 +138,7 @@ class Repo(object):
         c.execute('select size, mtime from files'
                   ' where digest=?', (digest,))
         if c.rowcount > 0:
-            size, mtime = c.fetchown()
+            size, mtime = c.fetchone()
             return {'size': size, 'mtime': mtime}
         return {}
 
@@ -132,13 +149,27 @@ class Repo(object):
                           (digest, st.st_size, st.st_mtime))
         self._changed = True
 
+    def find_name_size(self, name, size):
+        c = self.conn.cursor()
+        c.execute('select digest from names'
+                  ' where name=?',
+                  (name,))
+        digest, = c.fetchone() or [None]
+        c.execute('select size from files'
+                  ' where digest=?',
+                  (digest,))
+        other_size, = c.fetchone() or [-1]
+        if size == other_size:
+            return digest
+        return None
+
     def get_names(self, digest):
         c = self.conn.cursor()
         c.execute('select (name) from names'
                   ' where digest=?'
                   ' order by name',
                   (digest,))
-        names = c.fetchall()
+        return c.fetchall()
 
     def add_name(self, digest, name):
         assert len(digest) == util.SHA256_LEN, repr(digest)
@@ -163,8 +194,7 @@ class Repo(object):
                               [(digest, name) for name in names])
         self._changed = True
 
-    def set_names_batch(self, files):
-        digests = set(files.values())
+    def set_names_batch(self, files, digests):
         for digest in digests:
             assert len(digest) == util.SHA256_LEN, repr(digest)
         self.conn.executemany('delete from names where digest=?',
@@ -229,20 +259,30 @@ class Repo(object):
             else:
                 os.unlink(key_abs)
             os.link(fn, key_abs)
-            os.chmod(key_abs, 0o400)
+            os.chmod(key_abs, 0o422)
 
     def copy_in(self, src_fn, name):
         """Copy external file into repo (different filesystem)"""
+        st = os.stat(src_fn)
+        digest = self.find_name_size(name, st.st_size)
+        if digest:
+            log('file with same name and size exists, skipping %s' % src_fn)
+            return digest
         digest, tmp = self._copy_tmp(src_fn)
-        if self.exists(digest):
-            log('copy over %s -> %s' % (src_fn, name))
+        if not self.exists(digest):
+            log('copy new %s' % src_fn)
+            self._link_in(tmp.name, digest)
+            self.add_file(digest, tmp.name)
+            self.add_name(digest, name)
         else:
-            log('copy new %s -> %s' % (src_fn, name))
-        self._link_in(tmp.name, digest)
-        self.add_file(digest, tmp.name)
-        self.add_name(digest, name)
+            if name not in self.get_names(digest):
+                if not NO_ALIAS:
+                    log('file exists, add name %s' % name)
+                    self.add_name(digest, name)
+                else:
+                    log('file exists, not adding alias %s' % name)
+        tmp.close()
         return digest
-
 
     def link_in(self, fn, digest):
         """Link external file into repo (save filesystem)"""
@@ -287,6 +327,12 @@ def parse_index(fn):
 
 def do_import(args, repo, prefix):
     def store(src_fn):
+        name = os.path.join(prefix, src_fn).strip('/')
+        size = os.stat(src_fn).st_size
+        digest = repo.find_name_size(name, size)
+        if digest:
+            log('file with same name and size exists, skipping %s' % src_fn)
+            return
         digest = attr_digest = util.get_xattr_hash(src_fn)
         if digest is None:
             log('computing digest', src_fn)
@@ -305,24 +351,34 @@ def do_import(args, repo, prefix):
             repo.link_in(src_fn, digest)
             repo.add_file(digest, src_fn)
         # save filename in meta data
-        repo.add_name(digest, os.path.join(prefix, src_fn))
+        repo.add_name(digest, name)
 
+    t = time.time()
     for fn in _walk_files(args):
         if os.path.isfile(fn):
             store(fn)
         else:
             print('skip non-file', fn)
+        if time.time() - t > 5:
+            log('committing changes')
+            repo.commit()
+            t = time.time()
     print('done.')
 
 
 def do_copy(args, repo, prefix):
+    t = time.time()
     for fn in _walk_files(args):
         if os.path.isfile(fn):
-            name = os.path.join(prefix, fn)
+            name = os.path.join(prefix, fn).strip('/')
             digest = repo.copy_in(fn, name)
         else:
             print('skip non-file', fn)
-    repo.conn.commit()
+        if time.time() - t > 5:
+            log('committing changes')
+            repo.commit()
+            t = time.time()
+    repo.commit()
     print('done.')
 
 
@@ -490,17 +546,19 @@ def do_index(repo):
 
 def do_fix_path(repo):
     filenames = {}
+    digests = set()
     fix = False
     for name, digest in repo.list_file_names():
         if name.startswith('/'):
             print(digest, name)
             fix = True
             name = name.lstrip('/')
+        digests.add(digest)
         filenames[name] = digest
     if fix:
         print('set_names')
-        repo.set_names_batch(filenames)
-
+        repo.set_names_batch(filenames, digests)
+        repo.commit()
 
 
 
@@ -554,6 +612,15 @@ def do_link_files(args, repo):
                 repo.link_to(index[fn], fn)
 
 
+def do_list_files(args, repo):
+    import fnmatch
+    index = {}
+    for name, digest in repo.list_file_names():
+        for pat in args:
+            if fnmatch.fnmatch(name.lower(), pat):
+                print(name, digest)
+
+
 class PathInfo:
     def __init__(self, path, parent=None):
         self.path = path
@@ -593,9 +660,16 @@ def do_write_names(args, repo):
     if len(args) != 1:
         raise SystemExit('need one argument, index file')
     index = parse_index(args[0])
+    digests = set()
     objects = {}
     for name, digest in index.items():
+        digests.add(digest)
         objects.setdefault(digest, []).append(name)
+    for digest in digests:
+        m = repo.get_meta(digest)
+        if not m:
+            filename = repo.data(digest)
+            repo.add_file(digest, filename)
     for digest, names in objects.items():
         repo.set_names(digest, names)
 
@@ -615,7 +689,7 @@ def do_delete(args, repo):
 
 
 def main():
-    global DRY_RUN, LINK, FORCE, CONTINUE
+    global DRY_RUN, LINK, FORCE, CONTINUE, NO_ALIAS
 
     import optparse
     import logging
@@ -624,6 +698,8 @@ def main():
     parser.add_option('--prefix', '-p', default='/')
     parser.add_option('--dst', '-d', default=None)
     parser.add_option('--continue', '-c', default=None, dest='cont')
+    parser.add_option('--no-alias', '-A', default=False,
+                      dest='no_alias', action="store_true")
     parser.add_option('--force', '-f', default=False,
                      action="store_true",
                      help="force overwrite")
@@ -634,9 +710,12 @@ def main():
                       action='count', dest='verbose', default=0,
                       help="enable extra status output")
     options, args = parser.parse_args()
+    if len(args) == 0:
+        raise SystemExit(USAGE)
     action = args[0]
     args = args[1:]
     level = logging.WARNING # default
+    NO_ALIAS = options.no_alias
     if options.verbose == 1:
         level = logging.INFO
     elif options.verbose > 1:
@@ -649,6 +728,7 @@ def main():
     logging.basicConfig(level=level)
     if not options.repo:
         raise SystemExit('need --repo option')
+    os.umask(0o002)
     repo = Repo(options.repo)
     if action == 'init':
         repo.init()
@@ -679,6 +759,8 @@ def main():
         do_write_names(args, repo)
     elif action == 'deleted':
         do_show_deleted(repo)
+    elif action == 'ls':
+        do_list_files(args, repo)
     elif action == 'delete-missing':
         do_delete_missing(args, repo)
     elif action == 'delete':
