@@ -308,31 +308,29 @@ class Browser(object):
         self.master.destroy()
 
     def save_file(self, event=None):
-        files = {}
-        digests = set()
-        todo = collections.deque([self.tree.root])
-        changed = False
-        while todo:
-            n = todo.popleft()
-            if n.key:
-                path = n.get_path()
-                if self.tree.old_index.get(path) != n.key:
-                    changed = True
-                    print('write', path, n.key)
-                files[path] = n.key
-                digests.add(n.key)
-            todo.extend(n.children)
-        deleted = set()
-        for name, digest in self.tree.old_index.items():
-            if digest not in digests:
-                print('delete', digest, name)
-                deleted.add(digest)
-        if changed:
-            self.tree.repo.set_names_batch(files, digests)
-            self.tree.repo.commit()
-        elif deleted:
-            self.tree.repo.delete_files(list(deleted))
-            self.tree.repo.commit()
+        repo = self.tree.repo
+        def build_index(n):
+            files = {}
+            todo = collections.deque([n])
+            while todo:
+                n = todo.popleft()
+                if n.key:
+                    path = n.get_path()
+                    files[path] = n.key
+                todo.extend(n.children)
+            return files
+        new = build_index(self.tree.root)
+        if new != self.tree.old_index:
+            for name, digest in new.items():
+                if name not in self.tree.old_index:
+                    print('add', digest, name)
+                    repo.add_name(digest, name)
+            for name, digest in self.tree.old_index.items():
+                if name not in new:
+                    print('delete', digest, name)
+                    repo.remove_name(digest, name)
+            repo.commit()
+            self.tree.old_index = new
 
     def _create_ui(self):
         f = Frame(self.master)
@@ -365,6 +363,7 @@ def main():
         raise SystemExit('filename not specified')
 
     r = repo.Repo(options.repo)
+    r.load()
     tree = Tree(r)
     top = Tk()
     top.title(APP_TITLE)
