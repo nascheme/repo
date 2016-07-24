@@ -40,7 +40,11 @@ import pickle
 from util import log
 
 # command line options
-OPTIONS = None
+class OPTIONS:
+    dryrun = False
+    verbose = 0
+    no_alias = False
+    cont = None
 
 def ensure_dir(dn):
     if not os.path.exists(dn):
@@ -170,10 +174,12 @@ class Repo(object):
         self._changed = True
 
     def delete_files(self, digests):
+        if not digests:
+            return
         for digest in digests:
             del self._meta[digest]
-        for name in self.get_names(digest):
-            del self._index[name]
+            for name in self.get_names(digest):
+                del self._index[name]
         self._changed = True
 
     def set_names(self, digest, names):
@@ -281,7 +287,9 @@ class Repo(object):
         """Link repo object to new file"""
         key_abs = self.data(digest)
         if not OPTIONS.dryrun:
-            ensure_dir(os.path.dirname(dst_fn))
+            dn = os.path.dirname(dst_fn)
+            if dn:
+                ensure_dir(dn)
             if os.path.exists(dst_fn):
                 log('skip existing %s' % dst_fn)
             else:
@@ -309,10 +317,15 @@ def parse_index(fn):
     return index
 
 
+def _open_repo(args):
+    repo = Repo(args.repo)
+    repo.load()
+    return repo
 
-def do_import(args, repo, prefix):
+def do_import(args):
+    repo = _open_repo(args)
     def store(src_fn):
-        name = os.path.join(prefix, src_fn).strip('/')
+        name = os.path.join(args.prefix, src_fn).strip('/')
         size = os.stat(src_fn).st_size
         digest = repo.find_name_size(name, size)
         if digest:
@@ -339,7 +352,7 @@ def do_import(args, repo, prefix):
         repo.add_name(digest, name)
 
     t = time.time()
-    for fn in _walk_files(args):
+    for fn in _walk_files(args.files):
         if os.path.isfile(fn):
             store(fn)
         else:
@@ -348,14 +361,16 @@ def do_import(args, repo, prefix):
             log('committing changes')
             repo.commit()
             t = time.time()
+    repo.commit()
     print('done.')
 
 
-def do_copy(args, repo, prefix):
+def do_copy(args):
+    repo = _open_repo(args)
     t = time.time()
-    for fn in _walk_files(args):
+    for fn in _walk_files(args.files):
         if os.path.isfile(fn):
-            name = os.path.join(prefix, fn).strip('/')
+            name = os.path.join(args.prefix, fn).strip('/')
             digest = repo.copy_in(fn, name)
         else:
             print('skip non-file', fn)
@@ -424,7 +439,7 @@ def annex_fix(args, repo):
         _, _, digest = key.rpartition('--')
         return digest
 
-    def do_link(fn):
+    def do_link(fn, force=False):
         # link repo file into annex objects
         dst = os.readlink(fn)
         if '.git/annex/objects/' in dst and 'SHA256-' in dst:
@@ -433,7 +448,7 @@ def annex_fix(args, repo):
                 # found file in repo
                 obj_fn = annex_obj_path(dst)
                 if os.path.exists(obj_fn):
-                    if OPTIONS.force:
+                    if force:
                         repo.link_overwrite(digest, obj_fn)
                     else:
                         log('obj exists, skipping %s' % obj_fn)
@@ -445,7 +460,7 @@ def annex_fix(args, repo):
 
     for fn in _walk_files(args):
         if os.path.islink(fn):
-            do_link(fn)
+            do_link(fn, force=args.force)
     print('done.')
 
 
@@ -499,7 +514,8 @@ def _build_index(repo):
     return index
 
 
-def do_fix_path(repo):
+def do_fix_paths(args):
+    repo = _open_repo(args)
     filenames = {}
     digests = set()
     fix = False
@@ -511,31 +527,59 @@ def do_fix_path(repo):
         digests.add(digest)
         filenames[name] = digest
     if fix:
-        print('set_names')
         repo.set_names_batch(filenames, digests)
         repo.commit()
 
 
+def do_fix_times(args):
+    repo = _open_repo(args)
+    for digest in repo.list_files():
+        fn = repo.data(digest)
+        meta = repo.get_meta(digest)
+        st = os.stat(fn)
+        mtime = float(meta['mtime'])
+        if abs(mtime - st.st_mtime) >= 1:
+            log('fix mtime', digest)
+            os.utime(fn, (st.st_atime, mtime))
+        xattr_mtime = util.get_xattr_mtime(fn)
+        if abs(mtime - (xattr_mtime or 0)) > 1:
+            log('xattr mtime mismatch', digest)
 
-def do_scrub(repo):
+
+def do_scrub(args):
+    repo = _open_repo(args)
     n = 0
-    err_file = os.path.join(repo.root, 'errors.txt')
+    err_file = os.path.join(repo.root, 'scrub_errors.txt')
+    t = time.time()
     with util.open_text(err_file, 'a', buffering=1) as err_fp:
         def err(*args):
             print(*args, file=err_fp)
         err('scrub started %s' % datetime.datetime.now())
-        if OPTIONS.cont:
-            err('continue from %s' % OPTIONS.cont)
+        if args.cont:
+            err('continue from %s' % args.cont)
         for digest in repo.list_files():
-            if OPTIONS.cont:
-                if digest == OPTIONS.cont:
-                    OPTIONS.cont = False
+            if args.cont:
+                if digest == args.cont:
+                    args.cont = False
                 else:
                     continue # skip
+            if time.time() - t > 20:
+                # print progress
+                print('scrub', digest)
+                t = time.time()
             fn = repo.data(digest)
             if not os.path.exists(fn):
                 err('missing data', digest)
                 continue
+            meta = repo.get_meta(digest)
+            st = os.stat(fn)
+            if st.st_size != int(meta['size']):
+                err('size mismatch', digest, meta['size'], st.st_size)
+            if args.size and st.st_size > args.size:
+                continue # skip large file
+            if args.modified:
+                if abs(st.st_mtime - float(meta['mtime'])) < 5:
+                    continue # skip, modified time same
             digest2, tmp = util.hash_file(fn)
             log(digest, digest2)
             if digest != digest2:
@@ -548,31 +592,31 @@ def do_scrub(repo):
                     util.set_xattr_hash(fn, digest)
                     n += 1
     if n:
-        print('problems were found (%s), see errors.txt' % n)
+        print('problems were found (%s), see scrub_errors.txt' % n)
 
 
-def do_link_files(args, repo):
+def do_link_files(args):
     import fnmatch
+    repo = _open_repo(args)
     index = {}
     for name, digest in repo.list_file_names():
         index[name] = digest
     log('loaded %d files' % len(index))
-    for pat in args:
+    for pat in args.pats:
         for fn in index:
             if fnmatch.fnmatch(fn, pat):
                 print('link', fn)
-                if not OPTIONS.dryrun:
-                    ensure_dir(os.path.dirname(fn))
                 repo.link_to(index[fn], fn)
 
 
-def do_list_files(args, repo):
+def do_list_files(args):
     import fnmatch
-    index = {}
+    repo = _open_repo(args)
     for name, digest in repo.list_file_names():
-        for pat in args:
+        for pat in args.pats:
             if fnmatch.fnmatch(name.lower(), pat):
                 print(name, digest)
+                break
 
 
 class PathInfo:
@@ -610,94 +654,141 @@ def do_du_save(args, repo):
         pickle.dump(root, fp, protocol=2)
 
 
-def do_show_deleted(repo):
+def do_show_deleted(args):
+    repo = _open_repo(args)
     for digest in repo.get_deleted():
         print(digest)
 
-def do_delete_missing(args, repo):
-    for digest in args:
-        assert not repo.exists(digest)
-    repo.delete_files(args)
+def do_clean_missing(args):
+    repo = _open_repo(args)
+    delete = set()
+    for digest in repo.list_files():
+        if not repo.exists(digest):
+            log('removing', digest)
+            delete.add(digest)
+    repo.delete_files(delete)
+    repo.commit()
 
-def do_delete(args, repo):
-    digests = args
-    repo.delete_files(digests)
+def do_delete(args):
+    repo = _open_repo(args)
+    repo.delete_files(args.digests)
+    repo.commit()
 
 
 def main():
     global OPTIONS
-    import optparse
+    import argparse
     import logging
-    parser = optparse.OptionParser(USAGE)
-    parser.add_option('--repo', '-r', default=None)
-    parser.add_option('--prefix', '-p', default='/')
-    parser.add_option('--dst', '-d', default=None)
-    parser.add_option('--continue', '-c', default=None, dest='cont')
-    parser.add_option('--no-alias', '-A', default=False,
-                      dest='no_alias', action="store_true")
-    parser.add_option('--force', '-f', default=False,
-                     action="store_true",
-                     help="force overwrite")
-    parser.add_option('--dryrun', '-n', default=False,
-                      action="store_true",
-                      help="print actions, do not change anything")
-    parser.add_option('-v', '--verbose',
-                      action='count', dest='verbose', default=0,
-                      help="enable extra status output")
-    options, args = parser.parse_args()
-    if len(args) == 0:
-        raise SystemExit(USAGE)
-    OPTIONS = options
-    action = args[0]
-    args = args[1:]
-    level = logging.WARNING # default
-    if options.verbose == 1:
-        level = logging.INFO
-    elif options.verbose > 1:
-        level = logging.DEBUG
-    util.VERBOSE = options.verbose
-    #LINK = options.link
-    logging.basicConfig(level=level)
-    if not options.repo:
-        raise SystemExit('need --repo option')
+    parser = argparse.ArgumentParser(prog='repo.py')
+    subparsers = parser.add_subparsers()
+
+    parser.add_argument('--repo', '-r', default=None)
+    parser.add_argument('--dryrun', '-n', default=False,
+                        action="store_true",
+                        help="print actions, do not change anything")
+    parser.add_argument('-v', '--verbose',
+                        action='count', dest='verbose', default=0,
+                        help="enable extra status output")
+
+    add_sub = subparsers.add_parser
+
+    sub = add_sub('import',
+                  help='link files into repo')
+    sub.add_argument('--prefix', '-p', default='/')
+    sub.add_argument('files', nargs='*')
+    sub.set_defaults(func=do_import)
+
+    sub = add_sub('copy',
+                  help='copy files into repo')
+    sub.add_argument('--prefix', '-p', default='/')
+    sub.add_argument('files', nargs='*')
+    sub.set_defaults(func=do_copy)
+
+    sub = add_sub('ls',
+                  help='list matching files')
+    sub.add_argument('pats', nargs='*')
+    sub.set_defaults(func=do_list_files)
+
+    sub = add_sub('link',
+                  help='link match files from repo')
+    sub.add_argument('pats', nargs='*')
+    sub.set_defaults(func=do_link_files)
+
+    sub = add_sub('show-deleted',
+                  help='list objects in repo with no name')
+    sub.set_defaults(func=do_show_deleted)
+
+    sub = add_sub('delete',
+                  help='delete specified objects from repo')
+    sub.add_argument('digests', nargs='*')
+    sub.set_defaults(func=do_delete)
+
+    sub = add_sub('clean-missing',
+                  help='remove objects from index that do not exist on disk')
+    sub.set_defaults(func=do_clean_missing)
+
+    sub = add_sub('fix-times',
+                  help='repair file modification times from meta data')
+    sub.set_defaults(func=do_fix_times)
+
+    sub = add_sub('fix-paths',
+                  help='remove leading slash from paths')
+    sub.set_defaults(func=do_fix_paths)
+
+    sub = add_sub('scrub',
+                  help='verify hashes in repo')
+    sub.add_argument('--continue', '-c', default=None, dest='cont',
+                     help='continue from digest')
+    sub.add_argument('--size', '-s', default=None, type=int,
+                     help='only check objects smaller than this size')
+    sub.add_argument('--modified', '-m', default=False, action='store_true',
+                     help='only check objects with changed times')
+    sub.set_defaults(func=do_scrub)
+
+    args = parser.parse_args()
+    if not args.repo or not hasattr(args, 'func'):
+        parser.print_help()
+        return
+    util.VERBOSE = args.verbose
+    OPTIONS.dryrun = args.dryrun
     os.umask(0o002)
-    repo = Repo(options.repo)
-    repo.load()
-    if action == 'init':
-        pass
-    elif action == 'import':
-        # compute content-ids, link into repo, write meta-data
-        do_import(args, repo, options.prefix)
-    elif action == 'copy':
-        # copy files from another device, then import
-        do_copy(args, repo, options.prefix)
-    elif action == 'fix-path':
-        do_fix_path(repo)
-    elif action == 'scrub':
-        # check hashes
-        do_scrub(repo)
-    elif action == 'annex-fix':
-        # crawl symlinks, link found objects into .git/annex/objects
-        annex_fix(args, repo)
-    elif action == 'annex-add':
-        # crawl files, add to annex objects, replace file with symlink
-        annex_add(args, repo)
-    elif action == 'link':
-        # link files matching regex patterns
-        do_link_files(args, repo)
-    elif action == 'show-deleted':
-        do_show_deleted(repo)
-    elif action == 'delete':
-        do_delete(args, repo)
-    elif action == 'ls':
-        do_list_files(args, repo)
-    elif action == 'delete-missing':
-        do_delete_missing(args, repo)
-    elif action == 'du-save':
-        do_du_save(args, repo)
-    else:
-        raise SystemExit('unknown action %r' % action)
-    repo.commit()
+    args.func(args)
+
+    if 0:
+        parser.add_argument('--continue', '-c', default=None, dest='cont')
+        parser.add_argument('--no-alias', '-A', default=False,
+                          dest='no_alias', action="store_true")
+        parser.add_argument('--force', '-f', default=False,
+                         action="store_true",
+                         help="force overwrite")
+        options, args = parser.parse_args()
+        if len(args) == 0:
+            raise SystemExit(USAGE)
+        OPTIONS = options
+        action = args[0]
+        args = args[1:]
+        level = logging.WARNING # default
+        if options.verbose == 1:
+            level = logging.INFO
+        elif options.verbose > 1:
+            level = logging.DEBUG
+        util.VERBOSE = options.verbose
+        #LINK = options.link
+        logging.basicConfig(level=level)
+        if not options.repo:
+            raise SystemExit('need --repo option')
+        elif action == 'annex-fix':
+            # crawl symlinks, link found objects into .git/annex/objects
+            annex_fix(args, repo)
+        elif action == 'annex-add':
+            # crawl files, add to annex objects, replace file with symlink
+            annex_add(args, repo)
+        elif action == 'delete-missing':
+            do_delete_missing(args, repo)
+        elif action == 'du-save':
+            do_du_save(args, repo)
+        else:
+            raise SystemExit('unknown action %r' % action)
 
 if __name__ == '__main__':
     main()

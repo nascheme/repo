@@ -110,6 +110,24 @@ def get_xattr_hash(fn):
     return None
 
 
+def get_xattr_mtime(fn):
+    try:
+        d = xattr.getxattr(fn, XATTR_KEY) or None
+    except IOError:
+        return None
+    d = d.decode('ascii')
+    if ':' not in d:
+        return None
+    mtime, _, digest = d.partition(':')
+    if len(digest) != SHA256_LEN:
+        return None
+    try:
+        mtime = int(mtime)
+    except:
+        return None
+    return mtime
+
+
 def set_xattr_hash(fn, digest, mtime=None):
     # set extended attribute containing hash and mtime
     if mtime is None:
