@@ -15,6 +15,7 @@ USAGE = """Usage: %prog [options]
     link mataching files from repo
   ls <pat> [<pat> ...]
     list matching files
+  status <pat> [<pat> ...]
   show-deleted
     show objects with no name
   delete
@@ -621,6 +622,51 @@ def do_link_files(args):
                 repo.link_to(index[fn], fn)
 
 
+def do_status(args):
+    import fnmatch, glob
+    repo = _open_repo(args)
+    ok = set()
+    removed = set()
+    added = set()
+    changed = set()
+    index = {}
+    for name, digest in repo.list_file_names():
+        index[name] = digest
+    log('loaded %d files' % len(index))
+    for pat in args.pats:
+        for fn, digest in index.items():
+            if fnmatch.fnmatch(fn, pat):
+                if os.path.exists(fn):
+                    key_abs = repo.data(digest)
+                    if os.path.samefile(key_abs, fn):
+                        ok.add(fn)
+                    else:
+                        changed.add(fn)
+                else:
+                    removed.add(fn)
+        for fn in glob.glob(pat.replace('*', '**'), recursive=True):
+            if os.path.isdir(fn):
+                continue
+            if fn in ok:
+                pass
+            elif fn in changed:
+                pass
+            else:
+                added.add(fn)
+    if removed:
+        print('Removed:')
+        for fn in sorted(removed):
+            print('    %s' % fn)
+    if added:
+        print('Added:')
+        for fn in sorted(added):
+            print('    %s' % fn)
+    if changed:
+        print('Changed:')
+        for fn in sorted(changed):
+            print('    %s' % fn)
+
+
 def do_list_files(args):
     import fnmatch
     repo = _open_repo(args)
@@ -729,6 +775,11 @@ def main():
                   help='link match files from repo')
     sub.add_argument('pats', nargs='*')
     sub.set_defaults(func=do_link_files)
+
+    sub = add_sub('status',
+                  help='show status of linked files (new, removed, changed)')
+    sub.add_argument('pats', nargs='*')
+    sub.set_defaults(func=do_status)
 
     sub = add_sub('show-deleted',
                   help='list objects in repo with no name')
