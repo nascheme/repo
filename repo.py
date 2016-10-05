@@ -64,6 +64,14 @@ class Repo(object):
         self._meta = None
         self._changed = False
 
+    def init(self):
+        if os.path.exists(self.index_abs):
+            raise RuntimeError('index file exists')
+        with open(self.index_abs, 'wb') as fp:
+            pass
+        with open(self.meta_abs, 'wb') as fp:
+            pass
+
     def load(self):
         self._index = {}
         self._meta = {}
@@ -321,6 +329,10 @@ def _open_repo(args):
     repo = Repo(args.repo)
     repo.load()
     return repo
+
+def do_init(args):
+    repo = Repo(args.repo)
+    repo.init()
 
 def do_import(args):
     repo = _open_repo(args)
@@ -691,6 +703,10 @@ def main():
                         help="enable extra status output")
 
     add_sub = subparsers.add_parser
+
+    sub = add_sub('init',
+                  help='initialize a new repository')
+    sub.set_defaults(func=do_init)
 
     sub = add_sub('import',
                   help='link files into repo')
