@@ -57,52 +57,62 @@ Meta = collections.namedtuple('Meta', 'size mtime')
 class Repo(object):
     def __init__(self, fn):
         self.root = fn
+        # path to temporary directory, used with copying files into repo
         self.tmp_dir = os.path.join(fn, 'tmp')
+        # path to object data directory, stores contents of files
         self.obj_abs = os.path.join(fn, 'objects')
+        # hash to filename index
         self.index_abs = os.path.join(fn, 'index.txt')
+        # hash to meta data index (mtime, size)
         self.meta_abs = os.path.join(fn, 'meta.txt')
         self._index = None
         self._meta = None
+        # try if in-memory copy is dirty
         self._changed = False
 
     def init(self):
         if os.path.exists(self.index_abs):
             raise RuntimeError('index file exists')
-        with open(self.index_abs, 'wb') as fp:
-            pass
-        with open(self.meta_abs, 'wb') as fp:
-            pass
+        with self._lock_write():
+            with open(self.index_abs, 'wb') as fp:
+                pass
+            with open(self.meta_abs, 'wb') as fp:
+                pass
 
     def load(self):
+        # load index from disk
         self._index = {}
         self._meta = {}
-        if os.path.exists(self.index_abs):
-            with util.open_text(self.index_abs) as fp:
-                for line in fp:
-                    name, _, digest = line.rstrip().rpartition(' ')
-                    self._index[name] = digest
-            with util.open_text(self.meta_abs) as fp:
-                for line in fp:
-                    digest, size, mtime = line.strip().split()
-                    self._meta[digest] = Meta(size=size, mtime=mtime)
+        with self._lock_read():
+            if os.path.exists(self.index_abs):
+                with util.open_text(self.index_abs) as fp:
+                    for line in fp:
+                        name, _, digest = line.rstrip().rpartition(' ')
+                        self._index[name] = digest
+                with util.open_text(self.meta_abs) as fp:
+                    for line in fp:
+                        digest, size, mtime = line.strip().split()
+                        self._meta[digest] = Meta(size=size, mtime=mtime)
 
     def commit(self):
+        # write index to disk
         if not self._changed:
             return
-        with open(self.meta_abs + '.tmp', 'w') as fp:
-            for digest in sorted(self._meta):
-                meta = self._meta[digest]
-                fp.write('%s %s %s\n' % (digest, meta.size, meta.mtime))
-        with open(self.index_abs + '.tmp', 'w') as fp:
-            for name in sorted(self._index):
-                fp.write('%s %s\n' % (name, self._index[name]))
-        log('commiting changes')
-        os.rename(self.meta_abs + '.tmp', self.meta_abs)
-        os.rename(self.index_abs + '.tmp', self.index_abs)
+        with self._lock_write():
+            with open(self.meta_abs + '.tmp', 'w') as fp:
+                for digest in sorted(self._meta):
+                    meta = self._meta[digest]
+                    fp.write('%s %s %s\n' % (digest, meta.size, meta.mtime))
+            with open(self.index_abs + '.tmp', 'w') as fp:
+                for name in sorted(self._index):
+                    fp.write('%s %s\n' % (name, self._index[name]))
+            log('commiting changes')
+            os.rename(self.meta_abs + '.tmp', self.meta_abs)
+            os.rename(self.index_abs + '.tmp', self.index_abs)
         self._changed = False
 
     @contextlib.contextmanager
-    def lock_read(self):
+    def _lock_read(self):
         lockfn = os.path.join(self.root, 'lock')
         with open(lockfn, 'ab') as lock:
             fcntl.flock(lock, fcntl.LOCK_SH)
@@ -112,7 +122,7 @@ class Repo(object):
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
     @contextlib.contextmanager
-    def lock_write(self):
+    def _lock_write(self):
         lockfn = os.path.join(self.root, 'lock')
         with open(lockfn, 'ab') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -133,7 +143,7 @@ class Repo(object):
         parts = fn.split(os.path.sep)
         return ''.join(parts[-3:])
 
-    def exists(self, digest):
+    def data_exists(self, digest):
         key_abs = self.data(digest)
         return os.path.exists(key_abs)
 
@@ -143,7 +153,8 @@ class Repo(object):
             return {}
         return {'size': meta.size, 'mtime': meta.mtime}
 
-    def add_file(self, digest, filename):
+    def add_data(self, digest, filename):
+        # add content addressed data to repo
         st = os.stat(filename)
         self._meta[digest] = Meta(size=st.st_size, mtime=st.st_mtime)
         self._changed = True
@@ -186,7 +197,6 @@ class Repo(object):
         if not digests:
             return
         for digest in digests:
-            del self._meta[digest]
             for name in self.get_names(digest):
                 del self._index[name]
         self._changed = True
@@ -261,18 +271,21 @@ class Repo(object):
             os.link(fn, key_abs)
             os.chmod(key_abs, 0o422)
 
-    def copy_in(self, src_fn, name):
+    def copy_in(self, src_fn, name, overwrite=False):
         """Copy external file into repo (different filesystem)"""
+        if name in self._index and not overwrite:
+            log('file with same name exists, skipping %s' % src_fn)
+            return
         st = os.stat(src_fn)
         digest = self.find_name_size(name, st.st_size)
         if digest:
             log('file with same name and size exists, skipping %s' % src_fn)
-            return digest
+            return
         digest, tmp = self._copy_tmp(src_fn)
-        if not self.exists(digest):
-            log('copy new %s' % src_fn)
+        if not self.data_exists(digest):
+            log('copy new data %s' % src_fn)
             self._link_in(tmp.name, digest)
-            self.add_file(digest, tmp.name)
+            self.add_data(digest, tmp.name)
             self.add_name(digest, name)
         else:
             if name not in self.get_names(digest):
@@ -339,6 +352,9 @@ def do_import(args):
     repo = _open_repo(args)
     def store(src_fn):
         name = os.path.join(args.prefix, src_fn).strip('/')
+        if not args.overwrite and name in repo._index:
+            log('file with same name exists, skipping %s' % src_fn)
+            return
         size = os.stat(src_fn).st_size
         digest = repo.find_name_size(name, size)
         if digest:
@@ -349,7 +365,7 @@ def do_import(args):
             log('computing digest', src_fn)
             digest, tmp = util.hash_file(src_fn)
             assert len(digest) == util.SHA256_LEN, repr(digest)
-        if repo.exists(digest):
+        if repo.data_exists(digest):
             key_abs = repo.data(digest)
             if not os.path.samefile(src_fn, key_abs):
                 print('link from repo %r' % src_fn)
@@ -360,7 +376,7 @@ def do_import(args):
         else:
             print('import', src_fn)
             repo.link_in(src_fn, digest)
-            repo.add_file(digest, src_fn)
+            repo.add_data(digest, src_fn)
         # save filename in meta data
         repo.add_name(digest, name)
 
@@ -370,8 +386,8 @@ def do_import(args):
             store(fn)
         else:
             print('skip non-file', fn)
-        if time.time() - t > 5:
-            log('committing changes')
+        if time.time() - t > 20:
+            log('auto commit changes')
             repo.commit()
             t = time.time()
     repo.commit()
@@ -384,7 +400,7 @@ def do_copy(args):
     for fn in _walk_files(args.files):
         if os.path.isfile(fn):
             name = os.path.join(args.prefix, fn).strip('/')
-            digest = repo.copy_in(fn, name)
+            repo.copy_in(fn, name, overwrite=args.overwrite)
         else:
             print('skip non-file', fn)
         if time.time() - t > 5:
@@ -457,7 +473,7 @@ def annex_fix(args, repo):
         dst = os.readlink(fn)
         if '.git/annex/objects/' in dst and 'SHA256-' in dst:
             digest = annex_digest(dst)
-            if repo.exists(digest):
+            if repo.data_exists(digest):
                 # found file in repo
                 obj_fn = annex_obj_path(dst)
                 if os.path.exists(obj_fn):
@@ -522,7 +538,6 @@ def _build_index(repo):
         while path in index:
             path = '%s.%d' % (name, i)
             i += 1
-        log(path, digest)
         index[path] = digest
     return index
 
@@ -611,15 +626,12 @@ def do_scrub(args):
 def do_link_files(args):
     import fnmatch
     repo = _open_repo(args)
-    index = {}
-    for name, digest in repo.list_file_names():
-        index[name] = digest
+    index = _build_index(repo)
     log('loaded %d files' % len(index))
     for pat in args.pats:
-        for fn in index:
-            if fnmatch.fnmatch(fn, pat):
-                print('link', fn)
-                repo.link_to(index[fn], fn)
+        for fn in fnmatch.filter(index, pat):
+            print('link', fn)
+            repo.link_to(index[fn], fn)
 
 
 def do_status(args):
@@ -629,9 +641,7 @@ def do_status(args):
     removed = set()
     added = set()
     changed = set()
-    index = {}
-    for name, digest in repo.list_file_names():
-        index[name] = digest
+    index = _build_index(repo)
     log('loaded %d files' % len(index))
     for pat in args.pats:
         for fn, digest in index.items():
@@ -673,7 +683,10 @@ def do_list_files(args):
     for name, digest in repo.list_file_names():
         for pat in args.pats:
             if fnmatch.fnmatch(name.lower(), pat):
-                print(name, digest)
+                if args.long:
+                    print(name, digest)
+                else:
+                    print(name)
                 break
 
 
@@ -721,7 +734,7 @@ def do_clean_missing(args):
     repo = _open_repo(args)
     delete = set()
     for digest in repo.list_files():
-        if not repo.exists(digest):
+        if not repo.data_exists(digest):
             log('removing', digest)
             delete.add(digest)
     repo.delete_files(delete)
@@ -730,6 +743,20 @@ def do_clean_missing(args):
 def do_delete(args):
     repo = _open_repo(args)
     repo.delete_files(args.digests)
+    repo.commit()
+
+def do_delete_names(args):
+    import fnmatch
+    repo = _open_repo(args)
+    digests = set()
+    names = list(repo._index)
+    for pat in args.patterns:
+        for fn in fnmatch.filter(names, pat):
+            print('remove', fn)
+            if not OPTIONS.dryrun:
+                if fn in repo._index:
+                    del repo._index[fn]
+                    repo._changed = True
     repo.commit()
 
 
@@ -757,17 +784,26 @@ def main():
     sub = add_sub('import',
                   help='link files into repo')
     sub.add_argument('--prefix', '-p', default='/')
+    sub.add_argument('--overwrite', default=False,
+                     action='store_true',
+                     help='overwrite existing names in repo with new data')
     sub.add_argument('files', nargs='*')
     sub.set_defaults(func=do_import)
 
     sub = add_sub('copy',
                   help='copy files into repo')
     sub.add_argument('--prefix', '-p', default='/')
+    sub.add_argument('--overwrite', default=False,
+                     action='store_true',
+                     help='overwrite existing names in repo with new data')
     sub.add_argument('files', nargs='*')
     sub.set_defaults(func=do_copy)
 
     sub = add_sub('ls',
                   help='list matching files')
+    sub.add_argument('--long', '-l', default=False,
+                     action='store_true',
+                     help='show names and hashes')
     sub.add_argument('pats', nargs='*')
     sub.set_defaults(func=do_list_files)
 
@@ -789,6 +825,11 @@ def main():
                   help='delete specified objects from repo')
     sub.add_argument('digests', nargs='*')
     sub.set_defaults(func=do_delete)
+
+    sub = add_sub('delete-names',
+                  help='delete specified named files (by pattern)')
+    sub.add_argument('patterns', nargs='*')
+    sub.set_defaults(func=do_delete_names)
 
     sub = add_sub('clean-missing',
                   help='remove objects from index that do not exist on disk')
