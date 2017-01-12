@@ -11,6 +11,8 @@ USAGE = """Usage: %prog [options]
     link files into repo, write meta-data
   copy <file> [<file> ...]
     copy files into repo, write meta-data
+  merge <repo dir>
+    copy all files from other repo and merge
   link <pat> [<pat> ...]
     link mataching files from repo
   ls <pat> [<pat> ...]
@@ -427,6 +429,31 @@ def do_copy(args):
     print('done.')
 
 
+def do_merge(args):
+    repo = _open_repo(args)
+    t = time.time()
+    for fn in args.other_repo:
+        other = Repo(fn, readonly=True)
+        other.load()
+        for fn, digest in other.list_file_names():
+            digest2 = repo.get_name_digest(fn)
+            if digest2 == digest:
+                continue # already exists
+            elif digest2 is not None and not args.overwrite:
+                log('file with same name exists, skipping %s' % fn)
+                continue # don't overwrite, skip
+            if repo.data_exists(digest):
+                repo.add_name(digest, fn, overwrite=args.overwrite)
+            else:
+                repo.copy_in(other.data(digest), fn, overwrite=args.overwrite)
+            if time.time() - t > 5:
+                log('committing changes')
+                repo.commit()
+                t = time.time()
+    repo.commit()
+    print('done.')
+
+
 def _find_git(fn):
     dirname = fn
     depth = 0
@@ -817,6 +844,14 @@ def main():
                      help='overwrite existing names in repo with new data')
     sub.add_argument('files', nargs='*')
     sub.set_defaults(func=do_copy)
+
+    sub = add_sub('merge',
+                  help='merge files from other repo')
+    sub.add_argument('--overwrite', default=False,
+                     action='store_true',
+                     help='overwrite existing names in repo with new files')
+    sub.add_argument('other_repo', nargs='*')
+    sub.set_defaults(func=do_merge)
 
     sub = add_sub('ls',
                   help='list matching files')
