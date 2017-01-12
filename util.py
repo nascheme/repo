@@ -5,12 +5,17 @@ import struct
 import hashlib
 
 VERBOSE = False
+DEBUG = False
 SHA256_LEN = 64
 XATTR_KEY = 'user.repo.sha256'
 
 
 def log(*args, **kwargs):
-    if VERBOSE:
+    if VERBOSE or DEBUG:
+        print(*args, **kwargs)
+
+def debug(*args, **kwargs):
+    if DEBUG:
         print(*args, **kwargs)
 
 
@@ -94,7 +99,7 @@ def get_xattr_hash(fn):
     except IOError:
         return None
     d = d.decode('ascii')
-    log('found xattr %r' % d)
+    debug('found xattr %r' % d)
     if ':' not in d:
         return None
     mtime, _, digest = d.partition(':')
@@ -105,7 +110,7 @@ def get_xattr_hash(fn):
     except:
         return None
     if int(os.stat(fn).st_mtime) == mtime:
-        log('found good digest')
+        debug('found good digest')
         return digest
     return None
 

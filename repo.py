@@ -38,7 +38,7 @@ import contextlib
 import glob
 import sqlite3 as sqlite
 import pickle
-from util import log
+from util import log, debug
 
 # command line options
 class OPTIONS:
@@ -49,14 +49,15 @@ class OPTIONS:
 
 def ensure_dir(dn):
     if not os.path.exists(dn):
-        log('mkdir %r' % dn)
+        debug('mkdir %r' % dn)
         os.makedirs(dn)
 
 Meta = collections.namedtuple('Meta', 'size mtime')
 
 class Repo(object):
-    def __init__(self, fn):
+    def __init__(self, fn, readonly=False):
         self.root = fn
+        self.readonly = readonly
         # path to temporary directory, used with copying files into repo
         self.tmp_dir = os.path.join(fn, 'tmp')
         # path to object data directory, stores contents of files
@@ -98,6 +99,8 @@ class Repo(object):
         # write index to disk
         if not self._changed:
             return
+        if self.readonly:
+            raise SystemExit('readonly repo')
         with self._lock_write():
             with open(self.meta_abs + '.tmp', 'w') as fp:
                 for digest in sorted(self._meta):
@@ -106,7 +109,7 @@ class Repo(object):
             with open(self.index_abs + '.tmp', 'w') as fp:
                 for name in sorted(self._index):
                     fp.write('%s %s\n' % (name, self._index[name]))
-            log('commiting changes')
+            debug('commiting changes')
             os.rename(self.meta_abs + '.tmp', self.meta_abs)
             os.rename(self.index_abs + '.tmp', self.index_abs)
         self._changed = False
@@ -159,6 +162,9 @@ class Repo(object):
         self._meta[digest] = Meta(size=st.st_size, mtime=st.st_mtime)
         self._changed = True
 
+    def get_name_digest(self, name):
+        return self._index.get(name)
+
     def find_name_size(self, name, size):
         digest = self._index.get(name)
         if digest is None:
@@ -175,13 +181,22 @@ class Repo(object):
         names.sort()
         return names
 
-    def add_name(self, digest, name):
+    def add_name(self, digest, name, overwrite=False):
         assert len(digest) == util.SHA256_LEN, repr(digest)
         if OPTIONS.dryrun:
             return
-        if self._index.get(name) != digest:
+        digest2 = self._index.get(name)
+        if digest2 == digest:
+            pass # already exists
+        elif digest2 is None:
             self._index[name] = digest
             self._changed = True
+        else:
+            if overwrite:
+                self._index[name] = digest
+                self._changed = True
+            else:
+                log('file with name %r exists, not overwriting' % name)
 
     def remove_name(self, digest, name):
         assert len(digest) == util.SHA256_LEN, repr(digest)
@@ -283,15 +298,15 @@ class Repo(object):
             return
         digest, tmp = self._copy_tmp(src_fn)
         if not self.data_exists(digest):
-            log('copy new data %s' % src_fn)
+            log('copy new data %s -> %s' % (src_fn, name))
             self._link_in(tmp.name, digest)
             self.add_data(digest, tmp.name)
-            self.add_name(digest, name)
+            self.add_name(digest, name, overwrite=overwrite)
         else:
             if name not in self.get_names(digest):
                 if not OPTIONS.no_alias:
                     log('file exists, add name %s' % name)
-                    self.add_name(digest, name)
+                    self.add_name(digest, name, overwrite=overwrite)
                 else:
                     log('file exists, not adding alias %s' % name)
         tmp.close()
@@ -339,8 +354,8 @@ def parse_index(fn):
     return index
 
 
-def _open_repo(args):
-    repo = Repo(args.repo)
+def _open_repo(args, **kwargs):
+    repo = Repo(args.repo, **kwargs)
     repo.load()
     return repo
 
@@ -352,7 +367,8 @@ def do_import(args):
     repo = _open_repo(args)
     def store(src_fn):
         name = os.path.join(args.prefix, src_fn).strip('/')
-        if not args.overwrite and name in repo._index:
+        digest2 = repo.get_name_digest(name)
+        if digest2 is not None and not overwrite:
             log('file with same name exists, skipping %s' % src_fn)
             return
         size = os.stat(src_fn).st_size
@@ -362,7 +378,7 @@ def do_import(args):
             return
         digest = attr_digest = util.get_xattr_hash(src_fn)
         if digest is None:
-            log('computing digest', src_fn)
+            debug('computing digest', src_fn)
             digest, tmp = util.hash_file(src_fn)
             assert len(digest) == util.SHA256_LEN, repr(digest)
         if repo.data_exists(digest):
@@ -378,7 +394,7 @@ def do_import(args):
             repo.link_in(src_fn, digest)
             repo.add_data(digest, src_fn)
         # save filename in meta data
-        repo.add_name(digest, name)
+        repo.add_name(digest, name, overwrite=args.overwrite)
 
     t = time.time()
     for fn in _walk_files(args.files):
@@ -774,6 +790,9 @@ def main():
     parser.add_argument('-v', '--verbose',
                         action='count', dest='verbose', default=0,
                         help="enable extra status output")
+    parser.add_argument('-d', '--debug',
+                        action='count', dest='debug', default=0,
+                        help="enable debugging output")
 
     add_sub = subparsers.add_parser
 
@@ -858,45 +877,10 @@ def main():
         parser.print_help()
         return
     util.VERBOSE = args.verbose
+    util.DEBUG = args.debug
     OPTIONS.dryrun = args.dryrun
     os.umask(0o002)
     args.func(args)
-
-    if 0:
-        parser.add_argument('--continue', '-c', default=None, dest='cont')
-        parser.add_argument('--no-alias', '-A', default=False,
-                          dest='no_alias', action="store_true")
-        parser.add_argument('--force', '-f', default=False,
-                         action="store_true",
-                         help="force overwrite")
-        options, args = parser.parse_args()
-        if len(args) == 0:
-            raise SystemExit(USAGE)
-        OPTIONS = options
-        action = args[0]
-        args = args[1:]
-        level = logging.WARNING # default
-        if options.verbose == 1:
-            level = logging.INFO
-        elif options.verbose > 1:
-            level = logging.DEBUG
-        util.VERBOSE = options.verbose
-        #LINK = options.link
-        logging.basicConfig(level=level)
-        if not options.repo:
-            raise SystemExit('need --repo option')
-        elif action == 'annex-fix':
-            # crawl symlinks, link found objects into .git/annex/objects
-            annex_fix(args, repo)
-        elif action == 'annex-add':
-            # crawl files, add to annex objects, replace file with symlink
-            annex_add(args, repo)
-        elif action == 'delete-missing':
-            do_delete_missing(args, repo)
-        elif action == 'du-save':
-            do_du_save(args, repo)
-        else:
-            raise SystemExit('unknown action %r' % action)
 
 if __name__ == '__main__':
     main()
