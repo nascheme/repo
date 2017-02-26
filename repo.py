@@ -99,6 +99,8 @@ class Repo(object):
 
     def commit(self):
         # write index to disk
+        if OPTIONS.dryrun:
+            return
         if not self._changed:
             return
         if self.readonly:
