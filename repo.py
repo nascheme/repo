@@ -337,13 +337,15 @@ class Repo(object):
     def link_to(self, digest, dst_fn):
         """Link repo object to new file"""
         key_abs = self.data(digest)
-        if not OPTIONS.dryrun:
-            dn = os.path.dirname(dst_fn)
-            if dn:
+        dn = os.path.dirname(dst_fn)
+        if dn:
+            if not OPTIONS.dryrun:
                 ensure_dir(dn)
-            if os.path.exists(dst_fn):
-                log('skip existing %s' % dst_fn)
-            else:
+        if os.path.exists(dst_fn):
+            log('skip existing %s' % dst_fn)
+        else:
+            if not OPTIONS.dryrun:
+                print('link', dst_fn)
                 os.link(key_abs, dst_fn)
 
 
@@ -382,7 +384,7 @@ def do_import(args):
     def store(src_fn):
         name = os.path.join(args.prefix, src_fn).strip('/')
         digest2 = repo.get_name_digest(name)
-        if digest2 is not None and not overwrite:
+        if digest2 is not None and not args.overwrite:
             log('file with same name exists, skipping %s' % src_fn)
             return
         size = os.stat(src_fn).st_size
@@ -431,6 +433,7 @@ def do_copy(args):
         if os.path.isfile(fn):
             name = os.path.join(args.prefix, fn).strip('/')
             repo.copy_in(fn, name, overwrite=args.overwrite)
+            print('copy', name)
         else:
             print('skip non-file', fn)
         if time.time() - t > 5:
@@ -537,7 +540,6 @@ def annex_fix(args, repo):
                     else:
                         log('obj exists, skipping %s' % obj_fn)
                 else:
-                    print('link %s' % obj_fn)
                     repo.link_to(digest, obj_fn)
             else:
                 print('not found', fn)
@@ -685,7 +687,6 @@ def do_link_files(args):
     log('loaded %d files' % len(index))
     for pat in args.pats:
         for fn in fnmatch.filter(index, pat):
-            print('link', fn)
             repo.link_to(index[fn], fn)
 
 
