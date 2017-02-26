@@ -148,11 +148,16 @@ class Repo(object):
     def filename_digest(self, fn):
         fn = fn.strip()[:-2]
         parts = fn.split(os.path.sep)
+        if parts[-4] != 'SHA256':
+            raise ValueError('not a hash path %r' % fn)
         return ''.join(parts[-3:])
 
     def data_exists(self, digest):
         key_abs = self.data(digest)
         return os.path.exists(key_abs)
+
+    def has_meta(self, digest):
+        return digest in self._meta
 
     def get_meta(self, digest):
         meta = self._meta.get(digest)
@@ -211,6 +216,11 @@ class Repo(object):
         assert self._index[name] == digest
         del self._index[name]
         self._changed = True
+
+    def remove_meta(self, digest):
+        if digest in self._meta:
+            del self._meta[digest]
+            self._changed = True
 
     def delete_files(self, digests):
         if not digests:
@@ -772,8 +782,26 @@ def do_du_save(args, repo):
 
 def do_show_deleted(args):
     repo = _open_repo(args)
-    for digest in repo.get_deleted():
-        print(digest)
+    if not args.crawl:
+        deleted = repo.get_deleted()
+    else:
+        deleted = []
+        for dn, dirs, files in os.walk(repo.obj_abs):
+            for fn in files:
+                digest = repo.filename_digest(os.path.join(dn, fn))
+                if not repo.has_meta(digest):
+                    deleted.append(digest)
+    for digest in deleted:
+        if args.path:
+            print(repo.data(digest))
+        else:
+            print(digest)
+
+def do_clean_meta(args):
+    repo = _open_repo(args)
+    for digest in list(repo.get_deleted()):
+        repo.remove_meta(digest)
+    repo.commit()
 
 def do_clean_missing(args):
     repo = _open_repo(args)
@@ -875,6 +903,10 @@ def main():
 
     sub = add_sub('show-deleted',
                   help='list objects in repo with no name')
+    sub.add_argument('--path', '-p', default=False, action='store_true',
+                     help='show data path rather than hash')
+    sub.add_argument('--crawl', '-c', default=False, action='store_true',
+                     help='crawl data files rather than using meta db')
     sub.set_defaults(func=do_show_deleted)
 
     sub = add_sub('delete',
@@ -886,6 +918,10 @@ def main():
                   help='delete specified named files (by pattern)')
     sub.add_argument('patterns', nargs='*')
     sub.set_defaults(func=do_delete_names)
+
+    sub = add_sub('clean-meta',
+                  help='remove objects from meta DB that do not exist')
+    sub.set_defaults(func=do_clean_meta)
 
     sub = add_sub('clean-missing',
                   help='remove objects from index that do not exist on disk')
