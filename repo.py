@@ -634,6 +634,26 @@ def do_fix_paths(args):
         repo.commit()
 
 
+def do_ls_known(args):
+    repo = _open_repo(args)
+    for fn in _walk_files(args.dirs):
+        if os.path.isfile(fn):
+            digest = util.get_xattr_hash(fn)
+            if digest and repo.has_meta(digest):
+                print(fn)
+                if args.delete:
+                    os.unlink(fn)
+
+
+def do_ls_unknown(args):
+    repo = _open_repo(args)
+    for fn in _walk_files(args.dirs):
+        if os.path.isfile(fn):
+            digest = util.get_xattr_hash(fn)
+            if not digest or not repo.has_meta(digest):
+                print(fn)
+
+
 def do_fix_times(args):
     repo = _open_repo(args)
     for digest in repo.list_files():
@@ -928,6 +948,18 @@ def main():
                   help='link match files from repo')
     sub.add_argument('pats', nargs='*')
     sub.set_defaults(func=do_link_files)
+
+    sub = add_sub('known',
+                  help='find files that are stored in repo')
+    sub.add_argument('--delete', '-d', default=False, action='store_true',
+                     help='delete files that are known in repo')
+    sub.add_argument('dirs', nargs='*')
+    sub.set_defaults(func=do_ls_known)
+
+    sub = add_sub('unknown',
+                  help='find files that are not stored in repo')
+    sub.add_argument('dirs', nargs='*')
+    sub.set_defaults(func=do_ls_unknown)
 
     sub = add_sub('status',
                   help='show status of linked files (new, removed, changed)')
