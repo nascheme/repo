@@ -479,8 +479,10 @@ def do_merge(args):
                 log('file with same name exists, skipping %s' % fn)
                 continue # don't overwrite, skip
             if repo.data_exists(digest):
+                debug('add name', fn, digest)
                 repo.add_name(digest, fn, overwrite=args.overwrite)
             else:
+                debug('copy in', fn, digest)
                 repo.copy_in(other.data(digest), fn, overwrite=args.overwrite)
             repo.auto_commit()
     repo.commit()
