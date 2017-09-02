@@ -312,7 +312,7 @@ class Repo(object):
             else:
                 os.unlink(key_abs)
             os.link(fn, key_abs)
-            os.chmod(key_abs, 0o422)
+            os.chmod(key_abs, 0o444)
 
     def copy_in(self, src_fn, name, overwrite=False):
         """Copy external file into repo (different filesystem)"""
@@ -326,7 +326,7 @@ class Repo(object):
             return
         digest, tmp = self._copy_tmp(src_fn)
         if not self.data_exists(digest):
-            log('copy new data %s -> %s' % (src_fn, name))
+            log('copy new data %s -> %s' % (digest, name))
             self._link_in(tmp.name, digest)
             self.add_data(digest, tmp.name)
             self.add_name(digest, name, overwrite=overwrite)
@@ -455,7 +455,7 @@ def do_merge(args):
     for fn in args.other_repo:
         other = Repo(fn, readonly=True)
         other.load()
-        for fn, digest in other.list_file_names():
+        for fn, digest in sorted(other.list_file_names()):
             digest2 = repo.get_name_digest(fn)
             if digest2 == digest:
                 continue # already exists
@@ -635,7 +635,7 @@ def do_fix_times(args):
 
 def do_scrub(args):
     repo = _open_repo(args)
-    n = 0
+    problems = 0
     err_file = os.path.join(repo.root, 'scrub_errors.txt')
     t = time.time()
     with util.open_text(err_file, 'a', buffering=1) as err_fp:
@@ -662,24 +662,29 @@ def do_scrub(args):
             st = os.stat(fn)
             if st.st_size != int(meta['size']):
                 err('size mismatch', digest, meta['size'], st.st_size)
+            mtime_differs = abs(st.st_mtime - float(meta['mtime'])) > 5
+            if mtime_differs:
+                err('mtime differs', digest, meta['mtime'])
+            if args.fast:
+                continue # no check of hashes
             if args.size and st.st_size > args.size:
                 continue # skip large file
-            if args.modified:
-                if abs(st.st_mtime - float(meta['mtime'])) < 5:
-                    continue # skip, modified time same
+            if args.modified and not mtime_differs:
+                continue # skip, modified time same
+            # do the expensive hash
             digest2, tmp = util.hash_file(fn)
             log(digest, digest2)
             if digest != digest2:
                 err('checksum mismatch', digest)
-                n += 1
+                problems += 1
             else:
                 digest2 = util.get_xattr_hash(fn)
                 if digest2 != digest:
                     err('update xattr', digest)
                     util.set_xattr_hash(fn, digest)
-                    n += 1
-    if n:
-        print('problems were found (%s), see scrub_errors.txt' % n)
+                    problems += 1
+    if problems:
+        print('problems were found (%s), see scrub_errors.txt' % problems)
 
 
 def do_link_files(args):
@@ -946,6 +951,8 @@ def main():
                      help='only check objects smaller than this size')
     sub.add_argument('--modified', '-m', default=False, action='store_true',
                      help='only check objects with changed times')
+    sub.add_argument('--fast', '-f', default=False, action='store_true',
+                     help='only check sizes, skip rehashing file data')
     sub.set_defaults(func=do_scrub)
 
     args = parser.parse_args()
