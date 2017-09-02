@@ -54,6 +54,12 @@ def ensure_dir(dn):
         debug('mkdir %r' % dn)
         os.makedirs(dn)
 
+
+def prefix_path(prefix, fn):
+    name = os.path.join(prefix, fn).strip('/')
+    return os.path.normpath(name)
+
+
 Meta = collections.namedtuple('Meta', 'size mtime')
 
 class Repo(object):
@@ -382,7 +388,7 @@ def do_init(args):
 def do_import(args):
     repo = _open_repo(args)
     def store(src_fn):
-        name = os.path.join(args.prefix, src_fn).strip('/')
+        name = prefix_path(args.prefix, src_fn)
         digest2 = repo.get_name_digest(name)
         if digest2 is not None and not args.overwrite:
             log('file with same name exists, skipping %s' % src_fn)
@@ -431,7 +437,7 @@ def do_copy(args):
     t = time.time()
     for fn in _walk_files(args.files):
         if os.path.isfile(fn):
-            name = os.path.join(args.prefix, fn).strip('/')
+            name = prefix_path(args.prefix, src_fn)
             repo.copy_in(fn, name, overwrite=args.overwrite)
             print('copy', name)
         else:
