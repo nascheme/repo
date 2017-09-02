@@ -78,6 +78,8 @@ class Repo(object):
         self._meta = None
         # try if in-memory copy is dirty
         self._changed = False
+        # last commit time, for auto-commit
+        self._last_commit_time = time.time()
 
     def init(self):
         if os.path.exists(self.index_abs):
@@ -123,6 +125,12 @@ class Repo(object):
             os.rename(self.meta_abs + '.tmp', self.meta_abs)
             os.rename(self.index_abs + '.tmp', self.index_abs)
         self._changed = False
+
+    def auto_commit(self):
+        if time.time() - self._last_commit_time > 20:
+            log('auto commit changes')
+            self.commit()
+            self._last_commit_time = time.time()
 
     @contextlib.contextmanager
     def _lock_read(self):
@@ -418,23 +426,18 @@ def do_import(args):
         # save filename in meta data
         repo.add_name(digest, name, overwrite=args.overwrite)
 
-    t = time.time()
     for fn in _walk_files(args.files):
         if os.path.isfile(fn):
             store(fn)
         else:
             print('skip non-file', fn)
-        if time.time() - t > 20:
-            log('auto commit changes')
-            repo.commit()
-            t = time.time()
+        repo.auto_commit()
     repo.commit()
     print('done.')
 
 
 def do_copy(args):
     repo = _open_repo(args)
-    t = time.time()
     for fn in _walk_files(args.files):
         if os.path.isfile(fn):
             name = prefix_path(args.prefix, src_fn)
@@ -442,17 +445,13 @@ def do_copy(args):
             print('copy', name)
         else:
             print('skip non-file', fn)
-        if time.time() - t > 5:
-            log('committing changes')
-            repo.commit()
-            t = time.time()
+        repo.auto_commit()
     repo.commit()
     print('done.')
 
 
 def do_merge(args):
     repo = _open_repo(args)
-    t = time.time()
     for fn in args.other_repo:
         other = Repo(fn, readonly=True)
         other.load()
@@ -467,10 +466,7 @@ def do_merge(args):
                 repo.add_name(digest, fn, overwrite=args.overwrite)
             else:
                 repo.copy_in(other.data(digest), fn, overwrite=args.overwrite)
-            if time.time() - t > 5:
-                log('committing changes')
-                repo.commit()
-                t = time.time()
+            repo.auto_commit()
     repo.commit()
     print('done.')
 
