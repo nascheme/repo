@@ -236,6 +236,18 @@ class Repo(object):
             del self._meta[digest]
             self._changed = True
 
+    def remove_data(self, digest):
+        if digest in self._meta:
+            log('meta exists for %s, skipping' % digest)
+            return
+        fn = self.data(digest)
+        if os.path.exists(fn):
+            log('unlink %s' % fn)
+            if not OPTIONS.dryrun:
+                os.unlink(fn)
+        else:
+            log('data does not exist for %s' % digest)
+
     def delete_files(self, digests):
         if not digests:
             return
@@ -803,11 +815,17 @@ def do_show_deleted(args):
                 digest = repo.filename_digest(os.path.join(dn, fn))
                 if not repo.has_meta(digest):
                     deleted.append(digest)
-    for digest in deleted:
+    for digest in list(deleted):
         if args.path:
             print(repo.data(digest))
         else:
             print(digest)
+        if args.clean:
+            repo.remove_meta(digest)
+            repo.remove_data(digest)
+    if args.clean:
+        repo.commit()
+
 
 def do_clean_meta(args):
     repo = _open_repo(args)
@@ -922,6 +940,8 @@ def main():
                      help='show data path rather than hash')
     sub.add_argument('--crawl', '-c', default=False, action='store_true',
                      help='crawl data files rather than using meta db')
+    sub.add_argument('--clean', default=False, action='store_true',
+                     help='remove meta and file data for deleted items')
     sub.set_defaults(func=do_show_deleted)
 
     sub = add_sub('delete',
