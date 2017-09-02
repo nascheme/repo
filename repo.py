@@ -401,12 +401,16 @@ def do_import(args):
         if digest2 is not None and not args.overwrite:
             log('file with same name exists, skipping %s' % src_fn)
             return
-        size = os.stat(src_fn).st_size
-        digest = repo.find_name_size(name, size)
-        if digest:
-            log('file with same name and size exists, skipping %s' % src_fn)
-            return
-        digest = attr_digest = util.get_xattr_hash(src_fn)
+        if not args.overwrite:
+            size = os.stat(src_fn).st_size
+            digest = repo.find_name_size(name, size)
+            if digest:
+                log('file with same name and size exists, skipping %s' % src_fn)
+                return
+        if not args.hash:
+            digest = util.get_xattr_hash(src_fn)
+        else:
+            digest = None
         if digest is None:
             debug('computing digest', src_fn)
             digest, tmp = util.hash_file(src_fn)
@@ -871,6 +875,9 @@ def main():
     sub.add_argument('--overwrite', default=False,
                      action='store_true',
                      help='overwrite existing names in repo with new data')
+    sub.add_argument('--hash', default=False,
+                     action='store_true',
+                     help='Do not trust xattr hash info, rehash file.')
     sub.add_argument('files', nargs='*')
     sub.set_defaults(func=do_import)
 
