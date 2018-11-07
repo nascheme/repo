@@ -11,8 +11,8 @@ USAGE = """Usage: %prog [options]
     link files into repo, write meta-data
   copy <file> [<file> ...]
     copy files into repo, write meta-data
-  merge <repo dir>
-    copy all files from other repo and merge
+  pull <repo dir>
+    copy in files from other repo and merge
   link <pat> [<pat> ...]
     link mataching files from repo
   ls <pat> [<pat> ...]
@@ -26,6 +26,7 @@ USAGE = """Usage: %prog [options]
     verify hashes
 """
 
+import sys
 import os
 import tempfile
 import collections
@@ -277,6 +278,16 @@ class Repo(object):
             self._index[name] = digest
         self._changed = True
 
+    def rename_file(self, old, new):
+        log('renaming %r to %r' % (old, new))
+        digest = self._index.get(old)
+        if digest is not None:
+            del self._index[old]
+            self._index[new] = digest
+            self._changed = True
+        else:
+            print('no file named %r' % old)
+
     def list_files(self):
         """Generate list of all objects in the repo.  Generates hash key
         for each object.
@@ -456,7 +467,7 @@ def do_copy(args):
     repo = _open_repo(args)
     for fn in _walk_files(args.files):
         if os.path.isfile(fn):
-            name = prefix_path(args.prefix, src_fn)
+            name = prefix_path(args.prefix, fn)
             repo.copy_in(fn, name, overwrite=args.overwrite)
             print('copy', name)
         else:
@@ -466,7 +477,7 @@ def do_copy(args):
     print('done.')
 
 
-def do_merge(args):
+def do_pull(args):
     repo = _open_repo(args)
     for fn in args.other_repo:
         other = Repo(fn, readonly=True)
@@ -487,6 +498,22 @@ def do_merge(args):
             repo.auto_commit()
     repo.commit()
     print('done.')
+
+
+def do_diff(args):
+    repo = _open_repo(args)
+    for fn in args.other_repo:
+        other = Repo(fn, readonly=True)
+        other.load()
+        for fn, digest in other.list_file_names():
+            if repo.has_meta(digest):
+                continue
+            else:
+                if args.meta:
+                    meta = other.get_meta(digest)
+                    print('%s %s %s' % (digest, meta['size'], meta['mtime']))
+                else:
+                    print(fn)
 
 
 def _find_git(fn):
@@ -653,7 +680,7 @@ def do_ls_unknown(args):
         if os.path.isfile(fn):
             digest = util.get_xattr_hash(fn)
             if not digest or not repo.has_meta(digest):
-                print(fn)
+                print(fn, digest)
 
 
 def do_fix_times(args):
@@ -669,6 +696,21 @@ def do_fix_times(args):
         xattr_mtime = util.get_xattr_mtime(fn)
         if abs(mtime - (xattr_mtime or 0)) > 1:
             log('xattr mtime mismatch', digest)
+
+
+def do_cat(args):
+    repo = _open_repo(args)
+    for digest in args.digests:
+        fn = repo.data(digest)
+        if os.path.exists(fn):
+            sys.stdout.write('%s:\n' % digest)
+            with open(fn, 'rb') as fp:
+                while True:
+                    b = fp.read(10000)
+                    if not b:
+                        break
+                    s = b.decode('utf-8', errors='backslashreplace')
+                    sys.stdout.write(s)
 
 
 def do_scrub(args):
@@ -730,9 +772,13 @@ def do_link_files(args):
     repo = _open_repo(args)
     index = _build_index(repo)
     log('loaded %d files' % len(index))
+    matches = []
     for pat in args.pats:
         for fn in fnmatch.filter(index, pat):
-            repo.link_to(index[fn], fn)
+            matches.append((fn, index[fn]))
+    matches.sort()
+    for dst, src in matches:
+        repo.link_to(src, dst)
 
 
 def do_status(args):
@@ -884,6 +930,18 @@ def do_delete_names(args):
                     repo._changed = True
     repo.commit()
 
+def do_rename_files(args):
+    repo = _open_repo(args)
+    prefix = args.prefix
+    with open(args.rename_list, 'r') as fp:
+        for line in fp:
+            old, sep, new = line.partition('\t')
+            new = new[:-1]
+            if prefix:
+                old = prefix + old
+                new = prefix + new
+            repo.rename_file(old, new)
+    repo.commit()
 
 def main():
     global OPTIONS
@@ -930,13 +988,21 @@ def main():
     sub.add_argument('files', nargs='*')
     sub.set_defaults(func=do_copy)
 
-    sub = add_sub('merge',
-                  help='merge files from other repo')
+    sub = add_sub('pull',
+                  help='pull files from other repo')
     sub.add_argument('--overwrite', default=False,
                      action='store_true',
                      help='overwrite existing names in repo with new files')
     sub.add_argument('other_repo', nargs='*')
-    sub.set_defaults(func=do_merge)
+    sub.set_defaults(func=do_pull)
+
+    sub = add_sub('diff',
+                  help='compare files with other repo, print new in other')
+    sub.add_argument('--meta', default=False,
+                     action='store_true',
+                     help='print meta data line')
+    sub.add_argument('other_repo', nargs='*')
+    sub.set_defaults(func=do_diff)
 
     sub = add_sub('ls',
                   help='list matching files')
@@ -988,6 +1054,14 @@ def main():
     sub.add_argument('patterns', nargs='*')
     sub.set_defaults(func=do_delete_names)
 
+    sub = add_sub('rename-files',
+                  help='rename files, input is tab separated (old -> new)')
+    sub.add_argument('--prefix', '-p', default='',
+                     help='prefix path to append to all names')
+    sub.add_argument('rename_list',
+                     help='rename actions, one line per file, tab separated')
+    sub.set_defaults(func=do_rename_files)
+
     sub = add_sub('clean-meta',
                   help='remove objects from meta DB that do not exist')
     sub.set_defaults(func=do_clean_meta)
@@ -1003,6 +1077,12 @@ def main():
     sub = add_sub('fix-paths',
                   help='remove leading slash from paths')
     sub.set_defaults(func=do_fix_paths)
+
+    sub = add_sub('cat',
+                  help='given hashes, print data to stdout')
+    sub.add_argument('digests', nargs='*')
+    sub.set_defaults(func=do_cat)
+
 
     sub = add_sub('scrub',
                   help='verify hashes in repo')
