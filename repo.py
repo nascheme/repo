@@ -258,6 +258,17 @@ class Repo(object):
                 del self._index[name]
         self._changed = True
 
+    def delete_names(self, names):
+        if not names:
+            return
+        for name in names:
+            if name in self._index:
+                log('delete', name)
+                del self._index[name]
+            else:
+                log('no file named %r' % name)
+        self._changed = True
+
     def set_names(self, digest, names):
         assert len(digest) == util.SHA256_LEN, repr(digest)
         for name in self.get_names(digest):
@@ -927,6 +938,19 @@ def do_delete(args):
 def do_delete_names(args):
     import fnmatch
     repo = _open_repo(args)
+    names = list(args.names)
+    if args.infile:
+        log('reading names from file %r' % args.infile)
+        with open(args.infile) as fp:
+            for line in fp:
+                names.append(line.strip())
+    log('deleting %d files' % len(names))
+    repo.delete_names(names)
+    repo.commit()
+
+def do_delete_patterns(args):
+    import fnmatch
+    repo = _open_repo(args)
     digests = set()
     names = list(repo._index)
     for pat in args.patterns:
@@ -1060,9 +1084,16 @@ def main():
     sub.set_defaults(func=do_delete)
 
     sub = add_sub('delete-names',
+                  help='delete specified named files')
+    sub.add_argument('--infile', '-i', default=None,
+                     help='file containing filenames, one per line')
+    sub.add_argument('names', nargs='*')
+    sub.set_defaults(func=do_delete_names)
+
+    sub = add_sub('delete-patterns',
                   help='delete specified named files (by pattern)')
     sub.add_argument('patterns', nargs='*')
-    sub.set_defaults(func=do_delete_names)
+    sub.set_defaults(func=do_delete_patterns)
 
     sub = add_sub('rename-files',
                   help='rename files, input is tab separated (old -> new)')
