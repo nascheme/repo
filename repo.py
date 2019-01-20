@@ -254,6 +254,7 @@ class Repo(object):
             return
         for digest in digests:
             for name in self.get_names(digest):
+                log('delete', name)
                 del self._index[name]
         self._changed = True
 
@@ -913,7 +914,14 @@ def do_clean_missing(args):
 
 def do_delete(args):
     repo = _open_repo(args)
-    repo.delete_files(args.digests)
+    digests = list(args.digests)
+    if args.infile:
+        log('reading digests from file %r' % args.infile)
+        with open(args.infile) as fp:
+            for line in fp:
+                digests.append(line.strip())
+    log('deleting %d files' % len(digests))
+    repo.delete_files(digests)
     repo.commit()
 
 def do_delete_names(args):
@@ -1046,6 +1054,8 @@ def main():
 
     sub = add_sub('delete',
                   help='delete specified objects from repo')
+    sub.add_argument('--infile', '-i', default=None,
+                     help='file containing digests, one per line')
     sub.add_argument('digests', nargs='*')
     sub.set_defaults(func=do_delete)
 
