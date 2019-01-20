@@ -255,7 +255,8 @@ class Repo(object):
         for digest in digests:
             for name in self.get_names(digest):
                 log('delete', name)
-                del self._index[name]
+                if not OPTIONS.dryrun:
+                    del self._index[name]
         self._changed = True
 
     def delete_names(self, names):
@@ -264,7 +265,8 @@ class Repo(object):
         for name in names:
             if name in self._index:
                 log('delete', name)
-                del self._index[name]
+                if not OPTIONS.dryrun:
+                    del self._index[name]
             else:
                 log('no file named %r' % name)
         self._changed = True
@@ -949,17 +951,14 @@ def do_delete_names(args):
     repo.commit()
 
 def do_delete_patterns(args):
-    import fnmatch
     repo = _open_repo(args)
-    digests = set()
-    names = list(repo._index)
+    matches = set()
     for pat in args.patterns:
-        for fn in fnmatch.filter(names, pat):
-            print('remove', fn)
-            if not OPTIONS.dryrun:
-                if fn in repo._index:
-                    del repo._index[fn]
-                    repo._changed = True
+        pat = re.compile(pat)
+        for name in repo._index:
+            if pat.match(name):
+                matches.add(name)
+    repo.delete_names(matches)
     repo.commit()
 
 def do_rename_files(args):
@@ -1091,7 +1090,7 @@ def main():
     sub.set_defaults(func=do_delete_names)
 
     sub = add_sub('delete-patterns',
-                  help='delete specified named files (by pattern)')
+                  help='delete specified named files (by regex pattern)')
     sub.add_argument('patterns', nargs='*')
     sub.set_defaults(func=do_delete_patterns)
 
