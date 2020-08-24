@@ -321,7 +321,7 @@ class Repo(object):
                 yield digest
 
     def get_sizes(self):
-        for name, digest in self._index:
+        for name, digest in self._index.items():
             meta = self._meta[digest]
             yield name, digest, meta.size
 
@@ -795,6 +795,33 @@ def do_link_files(args):
         repo.link_to(src, dst)
 
 
+def do_find_dups(args):
+    min_size = args.min_size
+    suffixes = {
+        'K': 1e3,
+        'M': 1e6,
+        'G': 1e9,
+        'T': 1e12,
+        }
+    if min_size:
+        suffix = min_size[-1]
+        if suffix.isdigit():
+            min_size = float(min_size)
+        else:
+            min_size = float(min_size[:-1])
+            min_size *= suffixes[suffix.upper()]
+    repo = _open_repo(args)
+    names = collections.defaultdict(lambda : [])
+    for fn, digest, size in sorted(repo.get_sizes()):
+        if int(size) >= min_size:
+            names[digest].append(fn)
+    for digest, fn_list in sorted(names.items(), key=lambda item: item[1]):
+        if len(fn_list) > 1:
+            print(fn_list[0], digest)
+            for fn in fn_list[1:]:
+                print('  ', fn)
+
+
 def do_status(args):
     import fnmatch, glob
     repo = _open_repo(args)
@@ -1064,6 +1091,12 @@ def main():
                   help='show status of linked files (new, removed, changed)')
     sub.add_argument('pats', nargs='*')
     sub.set_defaults(func=do_status)
+
+    sub = add_sub('find-dups',
+                  help='show duplicated files (more than one link)')
+    sub.add_argument('--min-size', '-s', default=0,
+                     help='minimum size of duplicate')
+    sub.set_defaults(func=do_find_dups)
 
     sub = add_sub('show-deleted',
                   help='list objects in repo with no name')
