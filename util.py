@@ -82,7 +82,7 @@ def hash_file(src_fn, tmp=None):
     with open(src_fn, 'rb') as fp:
         size = 0
         while True:
-            block = fp.read(20000)
+            block = fp.read(1000000)
             if not block:
                 break
             h.update(block)
